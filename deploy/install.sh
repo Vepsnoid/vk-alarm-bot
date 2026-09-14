@@ -107,6 +107,6 @@ cat <<TXT
   4) открыть интерфейс:    http://<IP-сервера>:8000   (или настроить nginx: deploy/nginx.conf)
 
 Логин — ADMIN_USERNAME / ADMIN_PASSWORD из .env.
-Важно: замените заглушку `replace-with-a-strong-password` на свой пароль до открытия порта наружу.
+Важно: замените заглушку "replace-with-a-strong-password" на свой пароль до открытия порта наружу.
 Обновление в будущем: sudo ${APP_DIR}/deploy/deploy.sh
 TXT

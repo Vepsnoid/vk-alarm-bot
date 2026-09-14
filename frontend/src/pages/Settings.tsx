@@ -67,8 +67,8 @@ export default function Settings() {
     finally { setSaving(false) }
   }
 
-  const handleCreateUser = async (e: React.FormEvent) => {
-    e.preventDefault()
+  const handleCreateUser = async (e?: React.FormEvent | React.MouseEvent) => {
+    e?.preventDefault()
     setUsersError(''); setUsersNotice('')
     const username = newUser.username.trim()
     const password = newUser.password
@@ -87,6 +87,8 @@ export default function Settings() {
       setUsersError(err?.response?.data?.detail || 'Не удалось создать пользователя: ' + (err?.message || 'неизвестная ошибка'))
     } finally { setSavingUser(false) }
   }
+  // Enter в полях логина/пароля создаёт пользователя (в форме нет submit'а).
+  const onAddUserKeyDown = (e: React.KeyboardEvent) => { if (e.key === 'Enter') { e.preventDefault(); handleCreateUser() } }
   const handleResetPassword = async (user: UserItem) => { const p = prompt('Новый пароль для ' + user.username + ':'); if (!p?.trim()) return; try { await api.put('/users/' + user.id, { password: p.trim() }); alert('Пароль изменен') } catch (err: any) { alert(err?.response?.data?.detail || 'Ошибка') } }
   const handleToggleUserStatus = async (user: UserItem) => { try { await api.put('/users/' + user.id, { is_active: !user.is_active }); fetchUsers() } catch (err: any) { setUsersError(err?.response?.data?.detail || 'Ошибка') } }
   const handleDeleteUser = async (user: UserItem) => { if (!confirm('Удалить ' + user.username + '?')) return; try { await api.delete('/users/' + user.id); fetchUsers() } catch { alert('Ошибка') } }
@@ -184,12 +186,12 @@ export default function Settings() {
           </div>
           {usersError && <div className='p-3 mb-3 bg-red-50 dark:bg-red-950/40 text-red-600 dark:text-red-400 rounded-xl text-sm'>{usersError}</div>}
           {usersNotice && <div className='p-3 mb-3 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 rounded-xl text-sm'>{usersNotice}</div>}
-          {showAddUser && <form onSubmit={handleCreateUser} className='flex items-end gap-2 p-3 bg-slate-50 dark:bg-slate-800/60 rounded-xl'>
-            <div className='flex-1'><label className='text-xs text-slate-500 mb-1 block'>Логин</label><input value={newUser.username} onChange={e => setNewUser({ ...newUser, username: e.target.value })} className='input-field text-sm py-2' autoComplete='off' /></div>
-            <div className='flex-1'><label className='text-xs text-slate-500 mb-1 block'>Пароль</label><div className='relative'><input type={showUserPassword ? 'text' : 'password'} value={newUser.password} onChange={e => setNewUser({ ...newUser, password: e.target.value })} className='input-field text-sm py-2 pr-10' autoComplete='new-password' /><button type='button' onClick={() => setShowUserPassword(v => !v)} className='absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200' title={showUserPassword ? 'Скрыть пароль' : 'Показать пароль'}>{showUserPassword ? <EyeOff className='w-4 h-4' /> : <Eye className='w-4 h-4' />}</button></div></div>
+          {showAddUser && <div className='flex flex-wrap items-end gap-2 p-3 bg-slate-50 dark:bg-slate-800/60 rounded-xl'>
+            <div className='flex-1'><label className='text-xs text-slate-500 mb-1 block'>Логин</label><input value={newUser.username} onChange={e => setNewUser({ ...newUser, username: e.target.value })} onKeyDown={onAddUserKeyDown} className='input-field text-sm py-2' autoComplete='off' /></div>
+            <div className='flex-1'><label className='text-xs text-slate-500 mb-1 block'>Пароль</label><div className='relative'><input type={showUserPassword ? 'text' : 'password'} value={newUser.password} onChange={e => setNewUser({ ...newUser, password: e.target.value })} onKeyDown={onAddUserKeyDown} className='input-field text-sm py-2 pr-10' autoComplete='new-password' /><button type='button' onClick={() => setShowUserPassword(v => !v)} className='absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200' title={showUserPassword ? 'Скрыть пароль' : 'Показать пароль'}>{showUserPassword ? <EyeOff className='w-4 h-4' /> : <Eye className='w-4 h-4' />}</button></div></div>
             <div><label className='text-xs text-slate-500 mb-1 block'>Роль</label><select value={newUser.role} onChange={e => setNewUser({ ...newUser, role: e.target.value })} className='input-field text-sm py-2'><option value='user'>Пользователь</option><option value='admin'>Администратор</option></select></div>
-            <button type='submit' disabled={savingUser} className='btn-primary text-sm py-2 whitespace-nowrap'>{savingUser ? 'Создаю…' : 'Создать пользователя'}</button>
-          </form>}
+            <button type='button' onClick={() => handleCreateUser()} disabled={savingUser} className='btn-primary text-sm py-2 whitespace-nowrap'>{savingUser ? 'Создаю…' : 'Создать пользователя'}</button>
+          </div>}
           <div className='space-y-2'>
             {users.map(u => (
               <div key={u.id} className='flex items-center gap-3 p-3 bg-slate-50 dark:bg-slate-800/60 rounded-xl'>

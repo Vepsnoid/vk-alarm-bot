@@ -111,11 +111,35 @@ python tests/test_max_service.py
 
 ## Запуск на сервере (Ubuntu/Debian)
 
-```bash
-sudo apt update && sudo apt install -y python3-venv git nginx
+Нужен VPS с Ubuntu 22.04/24.04 (или Debian 12), доступ по SSH и права `sudo`.
+Понадобится ~250 МБ на диске (без Node.js). Node не нужен: собранный фронтенд уже в репозитории.
 
-sudo mkdir -p /opt && cd /opt
-sudo git clone https://github.com/Vepsnoid/vk-alarm-bot.git
+### Вариант 1 — одной командой (рекомендуется)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Vepsnoid/vk-alarm-bot/main/deploy/install.sh | sudo bash
+```
+
+Скрипт сам: поставит пакеты, склонирует репозиторий в `/opt/vk-alarm-bot`, создаст venv и
+установит зависимости, сделает `.env` из шаблона со случайным `SECRET_KEY`, выставит права,
+поставит и запустит systemd-сервис `vk-alarm`, затем проверит `/api/health`.
+
+После этого заполните настройки и перезапустите:
+
+```bash
+sudo nano /opt/vk-alarm-bot/.env      # ADMIN_USERNAME/ADMIN_PASSWORD, VK_SERVICE_TOKEN, MAX_BOT_TOKEN, ключ ИИ
+sudo systemctl restart vk-alarm
+curl http://127.0.0.1:8000/api/health
+```
+
+Интерфейс: `http://<IP-сервера>:8000` (или сразу настройте nginx/домен — см. ниже).
+
+### Вариант 2 — пошагово
+
+```bash
+sudo apt update && sudo apt install -y python3-venv git nginx curl
+
+sudo git clone https://github.com/Vepsnoid/vk-alarm-bot.git /opt/vk-alarm-bot
 cd /opt/vk-alarm-bot
 
 python3 -m venv backend/.venv
@@ -126,6 +150,7 @@ nano .env                      # SECRET_KEY, ADMIN_*, VK_SERVICE_TOKEN, MAX_BOT_
 
 # сервис работает от www-data и должен писать базу в backend/
 sudo chown -R www-data:www-data /opt/vk-alarm-bot
+sudo git config --global --add safe.directory /opt/vk-alarm-bot   # чтобы sudo git pull не ругался
 
 sudo cp deploy/vk-alarm.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -134,7 +159,7 @@ systemctl status vk-alarm --no-pager
 curl http://127.0.0.1:8000/api/health      # ожидаем {"status":"ok", ...}
 ```
 
-Домен и HTTPS через nginx:
+### Домен и HTTPS через nginx
 
 ```bash
 sudo cp deploy/nginx.conf /etc/nginx/sites-available/vk-alarm
@@ -144,11 +169,44 @@ sudo nginx -t && sudo systemctl reload nginx
 sudo apt install -y certbot python3-certbot-nginx && sudo certbot --nginx
 ```
 
-Обновление версии на сервере:
+Файрвол (если включён `ufw`): `sudo ufw allow OpenSSH && sudo ufw allow 'Nginx Full'`.
+Приложение слушает только `127.0.0.1:8000`, наружу его выставляет nginx — открывать порт 8000 не нужно.
+
+### Проверка после установки
+
+```bash
+systemctl is-active vk-alarm                                  # active
+curl -s http://127.0.0.1:8000/api/health                      # {"status":"ok",...}
+curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' \
+  https://api.deepseek.com/v1/models -H "Authorization: Bearer $AI_API_KEY"   # 200 ... (если используете DeepSeek)
+journalctl -u vk-alarm -n 50 --no-pager                       # логи приложения
+```
+
+Дальше в интерфейсе: «Настройки» → «Проверить токен ИИ», создать поток, нажать ▶ и убедиться,
+что в журнале потока есть `Проверка потока запущена` → `Проверка завершена за … мин`.
+
+### Обновление версии на сервере
 
 ```bash
 sudo /opt/vk-alarm-bot/deploy/deploy.sh
 ```
+
+Скрипт делает `git pull`, обновляет зависимости и перезапускает сервис (фронтенд уже собран в репозитории;
+если правите UI — соберите локально `npm run build`, закоммитьте `frontend/dist` и обновитесь).
+
+### Перенос текущих данных с локального компьютера (по желанию)
+
+Чтобы на сервере сразу были ваши потоки, события и логи — скопируйте базу (SQLite в режиме WAL,
+поэтому нужны все три файла) при остановленном сервисе:
+
+```bash
+sudo systemctl stop vk-alarm
+scp backend/vk_alarm.db backend/vk_alarm.db-wal backend/vk_alarm.db-shm user@server:/tmp/
+ssh user@server 'sudo mv /tmp/vk_alarm.db* /opt/vk-alarm-bot/backend/ && sudo chown www-data:www-data /opt/vk-alarm-bot/backend/vk_alarm.db* && sudo systemctl start vk-alarm'
+```
+
+Пароль администратора и токены с локальной машины при этом не переносятся — они задаются в `.env` на сервере
+(или логинитесь локальным админом, если в базе он уже есть).
 
 ## Данные и бэкапы
 

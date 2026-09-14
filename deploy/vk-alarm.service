@@ -11,7 +11,10 @@ Group=www-data
 
 # База SQLite создаётся в рабочем каталоге, поэтому запускаем из backend/
 WorkingDirectory=/opt/vk-alarm-bot/backend
-EnvironmentFile=-/opt/vk-alarm-bot/.env
+# Обратите внимание: .env НЕ передаётся сюда через EnvironmentFile — приложение
+# само читает /opt/vk-alarm-bot/.env, и переменные окружения имели бы приоритет
+# над файлом (тогда токены, сохранённые из веб-интерфейса, перестали бы
+# применяться до перезапуска сервиса).
 
 ExecStart=/opt/vk-alarm-bot/backend/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 

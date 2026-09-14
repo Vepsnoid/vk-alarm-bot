@@ -13,6 +13,9 @@ BRANCH="${BRANCH:-main}"
 
 echo "==> Обновляю код в $APP_DIR ($BRANCH)"
 cd "$APP_DIR"
+# Каталог принадлежит www-data, а команду запускают через sudo — без этой записи
+# git откажется работать («detected dubious ownership»).
+git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
 git fetch --prune origin
 git checkout "$BRANCH"
 git pull --ff-only origin "$BRANCH"

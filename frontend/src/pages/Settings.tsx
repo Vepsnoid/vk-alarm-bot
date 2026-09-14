@@ -28,6 +28,8 @@ export default function Settings() {
   const [showAddUser, setShowAddUser] = useState(false)
   const [newUser, setNewUser] = useState({ username: '', password: '', role: 'user' })
   const [showUserPassword, setShowUserPassword] = useState(false)
+  const [usersError, setUsersError] = useState('')
+  const [usersNotice, setUsersNotice] = useState('')
   const [savingUser, setSavingUser] = useState(false)
   const [saving, setSaving] = useState(false); const [saved, setSaved] = useState(false)
   const [checkingVk, setCheckingVk] = useState(false); const [checkingAi, setCheckingAi] = useState(false)
@@ -51,7 +53,7 @@ export default function Settings() {
     } catch (err: any) { setModels([]); setModelsError(err.response?.data?.detail || 'Ошибка загрузки моделей') } finally { setLoadingModels(false) }
   }
   const fetchSettings = async () => { try { const r = await api.get('/settings'); setSettings(r.data); if (r.data.ai_configured) loadModels({ provider: r.data.ai_provider, api_base: r.data.ai_api_base, api_key: r.data.ai_api_key }) } catch {} }
-  const fetchUsers = async () => { try { const r = await api.get('/users'); setUsers(r.data) } catch {} }
+  const fetchUsers = async () => { try { const r = await api.get('/users'); setUsers(r.data); setUsersError('') } catch (err: any) { setUsers([]); setUsersError(err?.response?.data?.detail || 'Не удалось загрузить список пользователей (проверьте права администратора)') } }
   const checkTokens = async () => { setCheckingVk(true); setCheckingAi(true); setCheckingMax(true); await fetchSettings(); setCheckingVk(false); setCheckingAi(false); setCheckingMax(false) }
   const onProviderChange = (provider: string) => {
     const base = PROVIDER_DEFAULT_BASE[provider] ?? settings.ai_api_base
@@ -65,9 +67,20 @@ export default function Settings() {
     finally { setSaving(false) }
   }
 
-  const handleCreateUser = async (e: React.FormEvent) => { e.preventDefault(); setSavingUser(true); try { await api.post('/users', newUser); setNewUser({ username: '', password: '', role: 'user' }); setShowAddUser(false); fetchUsers() } catch (err: any) { alert(err.response?.data?.detail || 'Ошибка') } finally { setSavingUser(false) } }
-  const handleResetPassword = async (user: UserItem) => { const p = prompt('Новый пароль для ' + user.username + ':'); if (!p?.trim()) return; try { await api.put('/users/' + user.id, { password: p.trim() }); alert('Пароль изменен') } catch { alert('Ошибка') } }
-  const handleToggleUserStatus = async (user: UserItem) => { try { await api.put('/users/' + user.id, { is_active: !user.is_active }); fetchUsers() } catch { alert('Ошибка') } }
+  const handleCreateUser = async (e: React.FormEvent) => {
+    e.preventDefault(); setSavingUser(true); setUsersError(''); setUsersNotice('')
+    try {
+      const r = await api.post('/users', newUser)
+      setNewUser({ username: '', password: '', role: 'user' })
+      setShowAddUser(false)
+      setUsersNotice('Пользователь «' + (r.data?.username || newUser.username) + '» создан')
+      fetchUsers()
+    } catch (err: any) {
+      setUsersError(err?.response?.data?.detail || 'Не удалось создать пользователя: ' + (err?.message || 'неизвестная ошибка'))
+    } finally { setSavingUser(false) }
+  }
+  const handleResetPassword = async (user: UserItem) => { const p = prompt('Новый пароль для ' + user.username + ':'); if (!p?.trim()) return; try { await api.put('/users/' + user.id, { password: p.trim() }); alert('Пароль изменен') } catch (err: any) { alert(err?.response?.data?.detail || 'Ошибка') } }
+  const handleToggleUserStatus = async (user: UserItem) => { try { await api.put('/users/' + user.id, { is_active: !user.is_active }); fetchUsers() } catch (err: any) { setUsersError(err?.response?.data?.detail || 'Ошибка') } }
   const handleDeleteUser = async (user: UserItem) => { if (!confirm('Удалить ' + user.username + '?')) return; try { await api.delete('/users/' + user.id); fetchUsers() } catch { alert('Ошибка') } }
 
   return (
@@ -161,6 +174,8 @@ export default function Settings() {
             <h2 className='text-lg font-semibold text-slate-900 dark:text-slate-100 flex items-center gap-2'><Users className='w-5 h-5 text-primary-500' /> Пользователи</h2>
             <button type='button' onClick={() => setShowAddUser(!showAddUser)} className='btn-secondary flex items-center gap-2 text-sm py-2'><UserPlus className='w-4 h-4' />{showAddUser ? 'Отмена' : 'Добавить'}</button>
           </div>
+          {usersError && <div className='p-3 mb-3 bg-red-50 dark:bg-red-950/40 text-red-600 dark:text-red-400 rounded-xl text-sm'>{usersError}</div>}
+          {usersNotice && <div className='p-3 mb-3 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 rounded-xl text-sm'>{usersNotice}</div>}
           {showAddUser && <form onSubmit={handleCreateUser} className='flex items-end gap-2 p-3 bg-slate-50 dark:bg-slate-800/60 rounded-xl'>
             <div className='flex-1'><label className='text-xs text-slate-500 mb-1 block'>Логин</label><input value={newUser.username} onChange={e => setNewUser({ ...newUser, username: e.target.value })} className='input-field text-sm py-2' required /></div>
             <div className='flex-1'><label className='text-xs text-slate-500 mb-1 block'>Пароль</label><div className='relative'><input type={showUserPassword ? 'text' : 'password'} value={newUser.password} onChange={e => setNewUser({ ...newUser, password: e.target.value })} className='input-field text-sm py-2 pr-10' required /><button type='button' onClick={() => setShowUserPassword(v => !v)} className='absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200' title={showUserPassword ? 'Скрыть пароль' : 'Показать пароль'}>{showUserPassword ? <EyeOff className='w-4 h-4' /> : <Eye className='w-4 h-4' />}</button></div></div>

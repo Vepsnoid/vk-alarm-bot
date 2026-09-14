@@ -59,13 +59,24 @@ if [[ "${APP_DIR}" != "/opt/vk-alarm-bot" ]]; then
 fi
 systemctl daemon-reload
 systemctl enable --now "${SERVICE}"
-sleep 2
-systemctl --no-pager --lines=8 status "${SERVICE}" || true
-
-echo "==> Проверка API"
-curl -fsS http://127.0.0.1:8000/api/health && echo || {
-  echo "API не ответил — смотрите: journalctl -u ${SERVICE} -n 50" >&2
-}
+echo "==> Ждём готовности API (до 60 с)"
+health=""
+for _ in $(seq 1 30); do
+  if health="$(curl -fsS --max-time 3 http://127.0.0.1:8000/api/health 2>/dev/null)"; then
+    break
+  fi
+  health=""
+  sleep 2
+done
+echo "    systemctl is-active ${SERVICE}: $(systemctl is-active "${SERVICE}" 2>/dev/null || true)"
+if [[ -n "${health}" ]]; then
+  echo "    API отвечает: ${health}"
+else
+  echo "    API не ответил за 60 с — последние строки лога:" >&2
+  journalctl -u "${SERVICE}" -n 30 --no-pager || true
+  echo "    частые причины: пустые SECRET_KEY/ADMIN_USERNAME/ADMIN_PASSWORD в .env," >&2
+  echo "    занятый порт 8000 или ошибка в токенах." >&2
+fi
 
 cat <<TXT
 
@@ -75,6 +86,7 @@ cat <<TXT
   3) проверить:            curl http://127.0.0.1:8000/api/health
   4) открыть интерфейс:    http://<IP-сервера>:8000   (или настроить nginx: deploy/nginx.conf)
 
-Логин по умолчанию — ADMIN_USERNAME / ADMIN_PASSWORD из .env.
+Логин — ADMIN_USERNAME / ADMIN_PASSWORD из .env.
+Важно: замените заглушку `replace-with-a-strong-password` на свой пароль до открытия порта наружу.
 Обновление в будущем: sudo ${APP_DIR}/deploy/deploy.sh
 TXT

@@ -1,5 +1,6 @@
 """AI rewrite service supporting OpenAI and Sber GigaChat."""
 
+import asyncio
 import uuid
 import httpx
 import logging
@@ -36,6 +37,16 @@ class AIService:
     # so page views neither block nor burn provider quota.
     _ai_status_cache: Dict[tuple, tuple] = {}
     AI_STATUS_TTL = 60.0
+
+    # A single transient DNS/connection hiccup used to publish raw, unfiltered
+    # posts (the provider error triggered the «send original» fallback). Retry a
+    # few times with a growing pause before treating the provider as unavailable.
+    AI_MAX_ATTEMPTS = 3
+    AI_RETRY_BASE_SECONDS = 1.5
+    # ...but a dead DNS/network makes every attempt hang for seconds, so after
+    # this many failures in a row the rest of the run skips the AI entirely
+    # instead of spending minutes per post (the outage is reported once).
+    AI_MAX_CONSECUTIVE_FAILURES = 3
 
     def __init__(self):
         self.reload_config()
@@ -241,6 +252,42 @@ class AIService:
                 text, system_prompt, max_length, fallback_to_original
             )
 
+    @classmethod
+    async def _post_chat(cls, url: str, headers: dict, payload: dict, *, verify: bool = True):
+        """POST to a chat-completions endpoint, retrying transient failures.
+
+        Network errors (DNS hiccups, refused/closed connections, timeouts) and
+        429/5xx responses are retried with a growing pause; permanent 4xx errors
+        (bad key, bad request) are raised at once. The last error is re-raised so
+        the caller keeps its existing fallback/skip behaviour.
+        """
+        attempts = cls.AI_MAX_ATTEMPTS
+        for attempt in range(attempts):
+            wait = cls.AI_RETRY_BASE_SECONDS * (2 ** attempt)
+            try:
+                async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
+                    response = await client.post(url, headers=headers, json=payload)
+                if response.status_code == 429 or response.status_code >= 500:
+                    if attempt == attempts - 1:
+                        response.raise_for_status()
+                    logger.warning(
+                        "AI provider returned HTTP %s, retry %d/%d in %.1fs",
+                        response.status_code, attempt + 1, attempts - 1, wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                response.raise_for_status()
+                return response
+            except httpx.TransportError as exc:
+                if attempt == attempts - 1:
+                    raise
+                logger.warning(
+                    "AI request failed (%s: %s), retry %d/%d in %.1fs",
+                    type(exc).__name__, exc, attempt + 1, attempts - 1, wait,
+                )
+                await asyncio.sleep(wait)
+        raise RuntimeError("AI request failed")  # pragma: no cover
+
     async def _rewrite_gigachat(
         self,
         text: str,
@@ -274,15 +321,13 @@ class AIService:
         }
 
         try:
-            async with httpx.AsyncClient(verify=False, timeout=60.0) as client:
-                res = await client.post(url, headers=headers, json=payload)
-                res.raise_for_status()
-                data = res.json()
-                choices = data.get("choices", [])
-                content = (
-                    choices[0].get("message", {}).get("content", "") if choices else ""
-                )
-                rewritten = content.strip() if isinstance(content, str) else ""
+            res = await self._post_chat(url, headers=headers, payload=payload, verify=False)
+            data = res.json()
+            choices = data.get("choices", [])
+            content = (
+                choices[0].get("message", {}).get("content", "") if choices else ""
+            )
+            rewritten = content.strip() if isinstance(content, str) else ""
 
             if _is_skip_answer(rewritten):
                 # The model decided the post is out of scope: publish nothing.
@@ -310,33 +355,31 @@ class AIService:
             return text, False, "AI API key is not configured"
 
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                response = await client.post(
-                    f"{self.api_base}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": self.model,
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {
-                                "role": "user",
-                                "content": "Текст поста:\n\n" + text[: self.ai_max_length],
-                            },
-                        ],
-                        "temperature": 0.7,
-                        "max_tokens": 4096,
-                    },
-                )
-                response.raise_for_status()
-                data = response.json()
-                choices = data.get("choices", [])
-                content = (
-                    choices[0].get("message", {}).get("content", "") if choices else ""
-                )
-                rewritten = content.strip() if isinstance(content, str) else ""
+            response = await self._post_chat(
+                f"{self.api_base}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                payload={
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {
+                            "role": "user",
+                            "content": "Текст поста:\n\n" + text[: self.ai_max_length],
+                        },
+                    ],
+                    "temperature": 0.7,
+                    "max_tokens": 4096,
+                },
+            )
+            data = response.json()
+            choices = data.get("choices", [])
+            content = (
+                choices[0].get("message", {}).get("content", "") if choices else ""
+            )
+            rewritten = content.strip() if isinstance(content, str) else ""
 
             if _is_skip_answer(rewritten):
                 # The model decided the post is out of scope: publish nothing.

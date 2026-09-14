@@ -267,9 +267,28 @@ class MonitorProcessor:
         # AI processing: transform the post text according to the prompt
         # (rewrite / transliterate / digest / ...). Runs AFTER keyword filtering.
         ready_posts = []
+        ai_failures = 0
+        ai_skipped_no_fallback = 0
+        ai_streak = 0
+        ai_disabled = False
         for post in passed_posts:
-            if not monitor.use_ai or not monitor.ai_prompt:
-                ready_posts.append((post, None, None))
+            if not monitor.use_ai or not monitor.ai_prompt or ai_disabled:
+                # No AI for this post: either it is switched off for the stream, or
+                # the provider just proved to be down (see the streak below).
+                if ai_disabled:
+                    monitor.ai_fallbacks += 1
+                    ai_failures += 1
+                    if monitor.ai_fallback_to_original:
+                        ready_posts.append((post, None, "ИИ недоступен"))
+                    else:
+                        ai_skipped_no_fallback += 1
+                        self._mark_event(
+                            post_events.get(int(post.get("id") or 0)),
+                            "filtered_ai",
+                            "ИИ недоступен, публикация пропущена",
+                        )
+                else:
+                    ready_posts.append((post, None, None))
                 continue
             try:
                 processed_text, ok, error = await self.ai.rewrite_text(
@@ -280,6 +299,7 @@ class MonitorProcessor:
                     monitor.ai_fallback_to_original,
                 )
                 if ok:
+                    ai_streak = 0
                     if not (processed_text or "").strip():
                         # The model answered with a skip marker: the post is out of
                         # scope, so it is not published (and counted as AI-filtered).
@@ -290,12 +310,48 @@ class MonitorProcessor:
                     ready_posts.append((post, processed_text, None))
                 else:
                     monitor.ai_fallbacks += 1
+                    ai_failures += 1
+                    ai_streak += 1
                     if monitor.ai_fallback_to_original:
                         ready_posts.append((post, None, error))
+                    else:
+                        # Fallback disabled: do not publish an unvetted post, but
+                        # record why it was dropped.
+                        ai_skipped_no_fallback += 1
+                        self._mark_event(
+                            post_events.get(int(post.get("id") or 0)),
+                            "filtered_ai",
+                            f"ИИ недоступен, публикация пропущена: {error}",
+                        )
+                    if ai_streak >= self.ai.AI_MAX_CONSECUTIVE_FAILURES:
+                        ai_disabled = True
             except Exception as e:
                 monitor.ai_fallbacks += 1
+                ai_failures += 1
+                ai_streak += 1
                 if monitor.ai_fallback_to_original:
                     ready_posts.append((post, None, str(e)))
+                else:
+                    ai_skipped_no_fallback += 1
+                    self._mark_event(
+                        post_events.get(int(post.get("id") or 0)),
+                        "filtered_ai",
+                        f"ИИ недоступен, публикация пропущена: {e}",
+                    )
+                if ai_streak >= self.ai.AI_MAX_CONSECUTIVE_FAILURES:
+                    ai_disabled = True
+
+        if ai_failures:
+            # An AI outage must be visible: otherwise raw, unfiltered posts are
+            # published (fallback on) or silently dropped (fallback off).
+            detail = (
+                f"ИИ недоступен: {ai_failures} пост(ов) — "
+                + ("опубликованы оригиналы без фильтра" if monitor.ai_fallback_to_original
+                   else f"публикация пропущена у {ai_skipped_no_fallback}")
+            )
+            await self._add_log(db, monitor.id, "warning", detail)
+            await self._notify_once(db, monitor, f"Сбой ИИ: {monitor.name}", detail)
+            await db.commit()
 
         monitor.posts_processed += len(all_new_posts)
         monitor.last_post_ids = last_ids

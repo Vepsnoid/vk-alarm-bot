@@ -57,18 +57,41 @@ async def run_scheduled_monitors():
         await processor.vk.aclose()
 
 
+PLACEHOLDER_ADMIN_PASSWORD = "replace-with-a-strong-password"
+
+
 async def seed_initial_user():
+    """Create the admin from ``.env`` or sync its password when ``.env`` changed.
+
+    ``.env`` is the documented source of truth for the admin account: editing
+    ``ADMIN_PASSWORD`` and restarting the service must be enough to change the
+    login. Without the sync below the old bcrypt hash stayed in the database and
+    the new password «не подходил».
+    """
     from app.models.database import AsyncSessionLocal
     from app.models.models import User
-    from app.core.security import get_password_hash
+    from app.core.security import get_password_hash, verify_password
     try:
+        app_settings = get_settings()
         async with AsyncSessionLocal() as db:
-            result = await db.execute(select(User).where(User.username == get_settings().admin_username))
-            if not result.scalar_one_or_none():
-                app_settings = get_settings()
-                admin_user = User(username=app_settings.admin_username, password_hash=get_password_hash(app_settings.admin_password), role="admin", is_active=True)
+            result = await db.execute(select(User).where(User.username == app_settings.admin_username))
+            admin_user = result.scalar_one_or_none()
+            if admin_user is None:
+                admin_user = User(
+                    username=app_settings.admin_username,
+                    password_hash=get_password_hash(app_settings.admin_password),
+                    role="admin",
+                    is_active=True,
+                )
                 db.add(admin_user)
                 await db.commit()
+                logger.info("Created admin '%s' from .env", app_settings.admin_username)
+            elif not verify_password(app_settings.admin_password, admin_user.password_hash or ""):
+                admin_user.password_hash = get_password_hash(app_settings.admin_password)
+                await db.commit()
+                logger.info("Admin '%s' password updated from .env", app_settings.admin_username)
+        if app_settings.admin_password == PLACEHOLDER_ADMIN_PASSWORD:
+            logger.warning("ADMIN_PASSWORD is still the template placeholder — set a real password in .env")
     except Exception as e:
         print(f"Failed to seed initial user: {e}")
 

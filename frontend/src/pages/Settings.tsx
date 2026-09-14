@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Save, Key, CheckCircle, XCircle, RefreshCw, Loader2, Palette, Sun, Moon, Monitor, Users, UserPlus, Shield, Trash2, KeyRound } from 'lucide-react'
+import { Save, Key, CheckCircle, XCircle, RefreshCw, Loader2, Palette, Sun, Moon, Monitor, Users, UserPlus, Shield, Trash2, KeyRound, Eye, EyeOff } from 'lucide-react'
 import api from '../api/client'
 import { useThemeStore } from '../store/themeStore'
 
@@ -27,6 +27,7 @@ export default function Settings() {
   const [users, setUsers] = useState<UserItem[]>([])
   const [showAddUser, setShowAddUser] = useState(false)
   const [newUser, setNewUser] = useState({ username: '', password: '', role: 'user' })
+  const [showUserPassword, setShowUserPassword] = useState(false)
   const [savingUser, setSavingUser] = useState(false)
   const [saving, setSaving] = useState(false); const [saved, setSaved] = useState(false)
   const [checkingVk, setCheckingVk] = useState(false); const [checkingAi, setCheckingAi] = useState(false)
@@ -162,7 +163,7 @@ export default function Settings() {
           </div>
           {showAddUser && <form onSubmit={handleCreateUser} className='flex items-end gap-2 p-3 bg-slate-50 dark:bg-slate-800/60 rounded-xl'>
             <div className='flex-1'><label className='text-xs text-slate-500 mb-1 block'>Логин</label><input value={newUser.username} onChange={e => setNewUser({ ...newUser, username: e.target.value })} className='input-field text-sm py-2' required /></div>
-            <div className='flex-1'><label className='text-xs text-slate-500 mb-1 block'>Пароль</label><input type='password' value={newUser.password} onChange={e => setNewUser({ ...newUser, password: e.target.value })} className='input-field text-sm py-2' required /></div>
+            <div className='flex-1'><label className='text-xs text-slate-500 mb-1 block'>Пароль</label><div className='relative'><input type={showUserPassword ? 'text' : 'password'} value={newUser.password} onChange={e => setNewUser({ ...newUser, password: e.target.value })} className='input-field text-sm py-2 pr-10' required /><button type='button' onClick={() => setShowUserPassword(v => !v)} className='absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200' title={showUserPassword ? 'Скрыть пароль' : 'Показать пароль'}>{showUserPassword ? <EyeOff className='w-4 h-4' /> : <Eye className='w-4 h-4' />}</button></div></div>
             <div><label className='text-xs text-slate-500 mb-1 block'>Роль</label><select value={newUser.role} onChange={e => setNewUser({ ...newUser, role: e.target.value })} className='input-field text-sm py-2'><option value='user'>Пользователь</option><option value='admin'>Администратор</option></select></div>
             <button type='submit' disabled={savingUser} className='btn-primary text-sm py-2'>{savingUser ? '...' : 'Создать'}</button>
           </form>}

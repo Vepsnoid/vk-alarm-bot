@@ -63,6 +63,15 @@ def set_ai_api_key(token: str) -> None:
     get_settings.cache_clear()
 
 
+def set_admin_password(password: str) -> None:
+    """Persist the admin password (used when it is changed from the panel).
+
+    Quoted so that spaces, ``#`` and dots survive the dotenv round-trip.
+    """
+    set_key(str(_ENV_FILE), "ADMIN_PASSWORD", password, quote_mode="always")
+    get_settings.cache_clear()
+
+
 def set_ai_settings(
     provider: str | None = None,
     model: str | None = None,

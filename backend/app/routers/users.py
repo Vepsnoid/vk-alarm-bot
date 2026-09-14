@@ -1,4 +1,6 @@
 from typing import List, Optional
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, update
@@ -10,6 +12,9 @@ from app.models.models import Monitor, User
 from app.routers.auth import get_current_user
 from app.services.owner_service import resolve_default_owner_id
 from app.core.security import get_password_hash
+from app.core.config import get_settings, set_admin_password
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/users", tags=["users"])
 
@@ -128,6 +133,14 @@ async def update_user(
 
     if data.password and data.password.strip():
         user.password_hash = get_password_hash(data.password.strip())
+        # Keep .env in sync when the .env admin's own password is changed here:
+        # startup seeding treats .env as the source of truth for that account, so
+        # without this the change would be reverted on the next restart.
+        if user.username == get_settings().admin_username:
+            try:
+                set_admin_password(data.password.strip())
+            except Exception as e:
+                logger.warning("Could not persist the admin password to .env: %s", e)
 
     if data.role and data.role not in ("admin", "user"):
         raise HTTPException(

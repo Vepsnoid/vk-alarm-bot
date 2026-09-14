@@ -58,7 +58,10 @@ if [[ "${APP_DIR}" != "/opt/vk-alarm-bot" ]]; then
   sed -i "s|/opt/vk-alarm-bot|${APP_DIR}|g" "/etc/systemd/system/${SERVICE}.service"
 fi
 systemctl daemon-reload
-systemctl enable --now "${SERVICE}"
+systemctl enable "${SERVICE}" >/dev/null 2>&1 || true
+# Всегда перезапускаем: при повторном запуске установщик подтянул свежий код,
+# а уже работающий сервис нужно перезапустить, чтобы он его подхватил.
+systemctl restart "${SERVICE}"
 echo "==> Ждём готовности API (до 60 с)"
 health=""
 for _ in $(seq 1 30); do

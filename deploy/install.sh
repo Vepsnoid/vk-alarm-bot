@@ -78,6 +78,23 @@ else
   echo "    занятый порт 8000 или ошибка в токенах." >&2
 fi
 
+echo "==> Что осталось заполнить в .env"
+while IFS= read -r key; do
+  value="$(grep -E "^${key}=" .env 2>/dev/null | head -n1 | cut -d= -f2- || true)"
+  case "${value}" in
+    ""|*your-*|replace-with-*|"replace-with-a-long-random-secret")
+      echo "    [ ] ${key} — НЕ заполнено" ;;
+    *)
+      echo "    [+] ${key} — заполнено" ;;
+  esac
+done <<'KEYS'
+ADMIN_USERNAME
+ADMIN_PASSWORD
+VK_SERVICE_TOKEN
+MAX_BOT_TOKEN
+AI_API_KEY
+KEYS
+
 cat <<TXT
 
 Готово. Осталось:

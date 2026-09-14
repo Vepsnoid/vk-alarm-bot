@@ -1,0 +1,192 @@
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, desc, update
+from pydantic import BaseModel
+from datetime import datetime
+
+from app.models.database import get_db
+from app.models.models import Monitor, User
+from app.routers.auth import get_current_user
+from app.services.owner_service import resolve_default_owner_id
+from app.core.security import get_password_hash
+
+router = APIRouter(prefix="/api/users", tags=["users"])
+
+
+async def require_admin_role(current_user=Depends(get_current_user)):
+    """Enforce admin role requirement."""
+    if current_user.get("role") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Доступ запрещен: требуется роль Администратора",
+        )
+    return current_user
+
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    role: str
+    is_active: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: str = "user"
+
+
+class UserUpdate(BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
+    role: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+@router.get("", response_model=List[UserResponse])
+@router.get("/", response_model=List[UserResponse])
+async def get_users(
+    db: AsyncSession = Depends(get_db),
+    admin=Depends(require_admin_role),
+):
+    """List all registered user accounts (Admin only)."""
+    result = await db.execute(select(User).order_by(desc(User.created_at)))
+    return result.scalars().all()
+
+
+@router.post("", response_model=UserResponse)
+@router.post("/", response_model=UserResponse)
+async def create_user(
+    data: UserCreate,
+    db: AsyncSession = Depends(get_db),
+    admin=Depends(require_admin_role),
+):
+    """Create a new user account (Admin only)."""
+    if not data.username.strip() or not data.password.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Имя пользователя и пароль не могут быть пустыми",
+        )
+
+    if data.role not in ("admin", "user"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Роль должна быть 'admin' или 'user'",
+        )
+
+    # Check unique username
+    existing = await db.execute(
+        select(User).where(User.username == data.username.strip())
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Пользователь с таким именем уже существует",
+        )
+
+    user = User(
+        username=data.username.strip(),
+        password_hash=get_password_hash(data.password),
+        role=data.role,
+        is_active=True,
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
+@router.put("/{user_id}", response_model=UserResponse)
+async def update_user(
+    user_id: int,
+    data: UserUpdate,
+    db: AsyncSession = Depends(get_db),
+    admin=Depends(require_admin_role),
+):
+    """Update user details, role, or reset password (Admin only)."""
+    user = await db.get(User, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Пользователь не найден"
+        )
+
+    if data.username and data.username.strip() != user.username:
+        existing = await db.execute(
+            select(User).where(User.username == data.username.strip())
+        )
+        if existing.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Пользователь с таким именем уже существует",
+            )
+        user.username = data.username.strip()
+
+    if data.password and data.password.strip():
+        user.password_hash = get_password_hash(data.password.strip())
+
+    if data.role and data.role not in ("admin", "user"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Роль должна быть 'admin' или 'user'",
+        )
+
+    # An admin must not lock themselves (or the last admin) out of the panel.
+    demotes_or_blocks = (data.role is not None and data.role != "admin") or data.is_active is False
+    if demotes_or_blocks and user.role == "admin":
+        if user_id == admin.get("id"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Нельзя снять роль администратора или заблокировать собственный аккаунт",
+            )
+        other_admins = await db.execute(
+            select(User).where(User.role == "admin", User.is_active.is_(True), User.id != user_id)
+        )
+        if not other_admins.scalars().first():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Нельзя снять роль последнего администратора",
+            )
+
+    if data.role:
+        user.role = data.role
+
+    if data.is_active is not None:
+        user.is_active = data.is_active
+
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
+@router.delete("/{user_id}")
+async def delete_user(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    admin=Depends(require_admin_role),
+):
+    """Delete a user account (Admin only)."""
+    if admin.get("id") == user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Нельзя удалить собственный аккаунт",
+        )
+
+    user = await db.get(User, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Пользователь не найден"
+        )
+
+    # Reassign the streams owned by the deleted account to an admin so that no
+    # stream is ever left without an owner.
+    target_admin_id = await resolve_default_owner_id(db, prefer=admin.get("id"))
+    if target_admin_id:
+        await db.execute(update(Monitor).where(Monitor.owner_id == user_id).values(owner_id=target_admin_id))
+    await db.delete(user)
+    await db.commit()
+    return {"message": "Пользователь удален"}

@@ -1,0 +1,60 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #root {
+    min-height: 100vh;
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    background-color: #f5f5f7;
+    color: #1d1d1f;
+    letter-spacing: -0.01em;
+    transition: background-color 0.3s ease, color 0.3s ease;
+  }
+  h1, h2, h3, h4 { letter-spacing: -0.022em; }
+}
+
+@layer components {
+  .card { @apply bg-white rounded-3xl p-6 transition-all duration-300; border: 1px solid rgba(0,0,0,0.045); box-shadow: 0 1px 2px rgba(0,0,0,0.04), 0 14px 34px -18px rgba(0,0,0,0.28); }
+  .card:hover { box-shadow: 0 1px 2px rgba(0,0,0,0.05), 0 22px 46px -20px rgba(0,0,0,0.32); }
+  .btn-primary { @apply text-white font-medium px-5 py-2.5 rounded-2xl transition-all duration-200 active:scale-[0.97] disabled:opacity-40; background-color: #0071e3; box-shadow: 0 1px 2px rgba(0,0,0,0.08), 0 8px 20px -8px rgba(0,113,227,0.6); }
+  .btn-primary:hover { background-color: #0077ed; }
+  .btn-secondary { @apply font-medium px-5 py-2.5 rounded-2xl transition-all duration-200 active:scale-[0.97]; background-color: rgba(120,120,128,0.12); color: #1d1d1f; }
+  .btn-secondary:hover { background-color: rgba(120,120,128,0.20); }
+  .input-field { @apply w-full px-4 py-3 rounded-2xl focus:outline-none transition-all duration-200 text-sm; background-color: rgba(120,120,128,0.10); color: #1d1d1f; border: 1px solid transparent; }
+  .input-field:focus { background-color: #ffffff; border-color: rgba(0,113,227,0.55); box-shadow: 0 0 0 4px rgba(0,113,227,0.15); }
+  .input-field::placeholder { color: #8e8e93; }
+  .toggle { @apply relative inline-flex h-7 w-12 items-center rounded-full transition-colors duration-200 focus:outline-none; }
+  .toggle-active { @apply bg-primary-500; }
+  .toggle-inactive { @apply bg-slate-300; }
+  .toggle-dot { @apply inline-block h-5 w-5 transform rounded-full bg-white transition duration-200; box-shadow: 0 1px 3px rgba(0,0,0,0.25); }
+}
+
+html.dark, html.dark body, html.dark #root { background-color: #000000 !important; color: #f5f5f7 !important; }
+html.dark .card { background-color: #1c1c1e !important; border-color: rgba(255,255,255,0.07) !important; color: #f5f5f7 !important; box-shadow: 0 1px 2px rgba(0,0,0,0.5), 0 16px 38px -20px rgba(0,0,0,0.9); }
+html.dark .bg-white { background-color: #1c1c1e !important; }
+html.dark .bg-slate-50 { background-color: #2c2c2e !important; }
+html.dark .bg-slate-100 { background-color: #2c2c2e !important; }
+html.dark .border-slate-100, html.dark .border-slate-200 { border-color: rgba(255,255,255,0.08) !important; }
+html.dark .text-slate-900 { color: #f5f5f7 !important; }
+html.dark .text-slate-800 { color: #f2f2f7 !important; }
+html.dark .text-slate-700 { color: #e5e5ea !important; }
+html.dark .text-slate-600 { color: #c7c7cc !important; }
+html.dark .text-slate-500 { color: #98989d !important; }
+html.dark .text-slate-400 { color: #8e8e93 !important; }
+html.dark aside { background-color: rgba(28,28,30,0.72) !important; border-color: rgba(255,255,255,0.08) !important; }
+html.dark header { background-color: rgba(28,28,30,0.72) !important; border-color: rgba(255,255,255,0.08) !important; }
+html.dark input, html.dark textarea, html.dark select, html.dark .input-field { background-color: rgba(120,120,128,0.24) !important; border-color: transparent !important; color: #f5f5f7 !important; }
+html.dark .input-field:focus { background-color: #1c1c1e !important; border-color: rgba(10,132,255,0.7) !important; }
+html.dark input::placeholder, html.dark textarea::placeholder { color: #8e8e93 !important; }
+html.dark .bg-indigo-50 { background-color: rgba(94, 92, 230, 0.22) !important; color: #b0afff !important; }
+html.dark .bg-emerald-50 { background-color: rgba(48, 209, 88, 0.18) !important; color: #6ee7a8 !important; }
+html.dark .bg-amber-50 { background-color: rgba(255, 179, 64, 0.18) !important; color: #ffd60a !important; }
+html.dark .bg-blue-50 { background-color: rgba(10, 132, 255, 0.2) !important; color: #64b5ff !important; }
+html.dark .bg-red-50 { background-color: rgba(255, 69, 58, 0.18) !important; color: #ff6961 !important; }
+html.dark .btn-secondary { background-color: rgba(120,120,128,0.24) !important; border-color: transparent !important; color: #f5f5f7 !important; }
+html.dark .btn-secondary:hover { background-color: rgba(120,120,128,0.34) !important; }
+html.dark .toggle-inactive { background-color: #48484a !important; }

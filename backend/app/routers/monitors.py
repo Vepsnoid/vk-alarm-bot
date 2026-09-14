@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from app.models.database import get_db, AsyncSessionLocal
 from app.models.models import Monitor, Event, Log
 from app.core.redaction import redact_sensitive_data
+from app.core.lists import normalize_monitor_lists
 from app.routers.auth import get_current_user
 from app.services.monitor_processor import MonitorProcessor
 from app.services.owner_service import resolve_default_owner_id
@@ -454,7 +455,10 @@ async def create_monitor(data: MonitorCreate, db: AsyncSession = Depends(get_db)
     # assign a different owner; regular users always own what they create.
     owner_id = data.owner_id if (user.get("role") == "admin" and data.owner_id) else user.get("id")
     owner_id = await resolve_default_owner_id(db, prefer=owner_id)
-    monitor = Monitor(**data.model_dump(exclude_none=True, exclude={"owner_id"}), owner_id=owner_id)
+    # Pasted lists are normalised (literal "\n", commas, semicolons, tabs, CRLF)
+    # so that every source/channel/keyword ends up on its own line.
+    fields = normalize_monitor_lists(data.model_dump(exclude_none=True, exclude={"owner_id"}))
+    monitor = Monitor(**fields, owner_id=owner_id)
     db.add(monitor)
     await db.commit()
     await db.refresh(monitor)
@@ -468,6 +472,9 @@ async def update_monitor(monitor_id: int, data: MonitorUpdate, db: AsyncSession 
         raise HTTPException(status_code=404, detail="Мониторинг не найден")
     validate_monitor_access(monitor, user)
     update_data = data.model_dump(exclude_none=True)
+    # Normalise pasted lists before anything else: the "changed?" comparison below
+    # then sees canonical values, so re-saving the same list is not a fresh start.
+    normalize_monitor_lists(update_data)
     raise_if_missing(collect_missing_required({k: v for k, v in update_data.items() if k in REQUIRED_MONITOR_FIELDS}))
     requested_owner = update_data.pop("owner_id", None)
     is_active_changed = "is_active" in update_data and update_data["is_active"] != monitor.is_active

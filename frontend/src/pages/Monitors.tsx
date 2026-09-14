@@ -95,8 +95,8 @@ export default function Monitors() {
                 {m.owner_id && usersMap[m.owner_id] && <span className='text-xs px-2 py-1 rounded-lg bg-indigo-50 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 font-medium flex items-center gap-1'><User className='w-3 h-3' />{usersMap[m.owner_id]}</span>}
               </div>
               <div className='flex flex-wrap items-center gap-6 mt-2 text-sm text-slate-500 dark:text-slate-400'>
-                <span>Источники: {m.source_channels.split('\n').length}</span>
-                <span>Max каналы: {m.max_channels ? m.max_channels.split('\n').length : 0}</span>
+                <span>Источники: {m.source_channels.split('\n').filter(s => s.trim()).length}</span>
+                <span>Max каналы: {m.max_channels ? m.max_channels.split('\n').filter(s => s.trim()).length : 0}</span>
                 <span>Обработано: {m.posts_processed}</span>
                 <span>Отправлено: {m.posts_published}</span>
                 <span>Отсеяно (слова/ER): {m.posts_filtered_keywords}/{m.posts_filtered_er}</span>

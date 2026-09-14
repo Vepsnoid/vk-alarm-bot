@@ -152,6 +152,33 @@ async def backfill_stream_owners():
         print(f"Failed to backfill stream owners: {e}")
 
 
+async def normalize_stored_lists():
+    """Fix list fields saved before normalisation (literal ``\\n``, commas, …).
+
+    A stream whose ``source_channels`` holds ``"durov\\npublic1"`` (literal
+    backslash-n) is treated as a single source: the UI shows «Источники: 1» and
+    the run cannot resolve it. Rewriting such rows on startup repairs them.
+    """
+    from app.models.database import AsyncSessionLocal
+    from app.models.models import Monitor
+    from app.core.lists import LIST_FIELDS, normalize_monitor_lists
+
+    fixed = 0
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(select(Monitor))).scalars().all()
+        for row in rows:
+            values = {key: getattr(row, key, None) for key in LIST_FIELDS}
+            normalize_monitor_lists(values)
+            changed = {key: value for key, value in values.items() if value != getattr(row, key, None)}
+            if changed:
+                for key, value in changed.items():
+                    setattr(row, key, value)
+                fixed += 1
+        if fixed:
+            await db.commit()
+            logger.info("Normalised pasted lists for %s stream(s)", fixed)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app_settings = get_settings()
@@ -161,6 +188,7 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await migrate_sqlite_schema()
+    await normalize_stored_lists()
     await redact_stored_secrets()
     await seed_initial_user()
     await backfill_stream_owners()

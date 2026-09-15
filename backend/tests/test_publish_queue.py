@@ -48,6 +48,8 @@ class FakeMaxService:
     error: object = None
     # Каналы, для которых надо бросать ``error`` (пусто = для всех).
     fail_chats: set = set()
+    # Вложения, переданные в последние отправки (для проверки медиа-путей).
+    attachments_seen: list = []
 
     def __init__(self, token: str = ""):
         self.token = token
@@ -63,6 +65,7 @@ class FakeMaxService:
         # Настоящий MaxService дописывает ссылку на источник сам, поэтому здесь
         # запоминаем и её: важно, что ссылка восстановлена из события.
         FakeMaxService.sent.append((chat_id, text, original_url))
+        FakeMaxService.attachments_seen.append(list(attachments or []))
         return True
 
     async def aclose(self):
@@ -73,6 +76,7 @@ def _reset_fake():
     FakeMaxService.sent = []
     FakeMaxService.error = None
     FakeMaxService.fail_chats = set()
+    FakeMaxService.attachments_seen = []
 
 
 def _new_engine():
@@ -88,7 +92,7 @@ def _processor():
     proc = MonitorProcessor()
 
     async def no_attachments(max_service, monitor, post):
-        return []
+        return [], []
 
     proc._build_max_attachments = no_attachments
     return proc, original
@@ -501,6 +505,84 @@ def test_legacy_pending_event_targets_all_channels():
     asyncio.run(scenario())
 
 
+def test_transient_media_failure_is_queued():
+    """Сеть/5xx при подготовке вложения → пост ждёт повтора, без медиа не уходит."""
+    _reset_fake()
+
+    async def scenario():
+        engine, sessions = _new_engine()
+        proc, original = _processor()
+
+        async def transient_attachments(max_service, monitor, post):
+            return [], [{
+                "url": "https://vk.com/photo1.jpg",
+                "error": "сеть при скачивании: timed out",
+                "transient": True,
+            }]
+
+        proc._build_max_attachments = transient_attachments
+        try:
+            monitor_id = await _prepare(sessions)
+            async with sessions() as db:
+                monitor = await db.get(Monitor, monitor_id)
+                await proc._send_to_max(db, monitor, dict(POST), None, None)
+                await db.commit()
+
+                event = (await _events(db))[0]
+                assert event.status == "pending", (event.status, event.error_message)
+                assert "медиа" in (event.error_message or ""), event.error_message
+                assert FakeMaxService.sent == [], "пост не должен уходить без вложения"
+        finally:
+            await proc.vk.aclose()
+            processor_module.MaxService = original
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_permanent_media_failure_publishes_with_warning():
+    """Файл удалён/слишком большой: пост уходит с рабочими вложениями и предупреждением."""
+    _reset_fake()
+
+    async def scenario():
+        engine, sessions = _new_engine()
+        proc, original = _processor()
+
+        good_attachment = {"type": "image", "payload": {"token": "tok-1"}}
+
+        async def permanent_attachments(max_service, monitor, post):
+            return [good_attachment], [{
+                "url": "https://vk.com/gone.jpg",
+                "error": "HTTP 404 при скачивании",
+                "transient": False,
+            }]
+
+        proc._build_max_attachments = permanent_attachments
+        try:
+            monitor_id = await _prepare(sessions)
+            async with sessions() as db:
+                monitor = await db.get(Monitor, monitor_id)
+                await proc._send_to_max(db, monitor, dict(POST), None, None)
+                await db.commit()
+
+                event = (await _events(db))[0]
+                assert event.status == "sent", (event.status, event.error_message)
+                assert "не прикреплены" in (event.error_message or ""), event.error_message
+                assert "404" in (event.error_message or ""), event.error_message
+                assert FakeMaxService.attachments_seen == [[good_attachment]], FakeMaxService.attachments_seen
+
+                notifications = (await db.execute(
+                    select(Notification).where(Notification.monitor_id == monitor_id)
+                )).scalars().all()
+                assert any("Вложения не прикреплены" in (n.title or "") for n in notifications), [n.title for n in notifications]
+        finally:
+            await proc.vk.aclose()
+            processor_module.MaxService = original
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 _TESTS = [
     ("временный сбой: пост уходит в очередь и доставляется", test_transient_failure_is_retried),
     ("число попыток ограничено", test_attempts_are_bounded),
@@ -513,6 +595,8 @@ _TESTS = [
     ("4xx канала не блокирует доставку", test_terminal_channel_failure_does_not_block_delivery),
     ("повторы не плодят уведомления", test_retry_notifications_do_not_multiply),
     ("старое pending-событие: повтор во все каналы", test_legacy_pending_event_targets_all_channels),
+    ("временный сбой медиа: повтор", test_transient_media_failure_is_queued),
+    ("постоянный сбой медиа: публикация с предупреждением", test_permanent_media_failure_publishes_with_warning),
 ]
 
 if __name__ == "__main__":

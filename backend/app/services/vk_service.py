@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.core.config import get_settings
 from app.core.redaction import redact_sensitive_data
+from app.core.security import prune_ttl_cache, secret_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -148,11 +149,13 @@ class VKService:
         # repeated checks must not spend VK API quota (and they are throttled too).
         if not cls._is_valid_token(token):
             return False, False
-        cached = cls._token_status_cache.get(token)
+        cache_key = secret_fingerprint(token)
+        cached = cls._token_status_cache.get(cache_key)
         if cached and time.monotonic() - cached[0] < cls.TOKEN_STATUS_TTL:
             return cached[1]
         status = await cls._fetch_token_status(token)
-        cls._token_status_cache[token] = (time.monotonic(), status)
+        cls._token_status_cache[cache_key] = (time.monotonic(), status)
+        prune_ttl_cache(cls._token_status_cache, cls.TOKEN_STATUS_TTL)
         return status
 
     @classmethod

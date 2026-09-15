@@ -12,7 +12,7 @@ from app.models.models import Monitor, User
 from app.routers.auth import get_current_user
 from app.services.owner_service import resolve_default_owner_id
 from app.core.security import get_password_hash, password_byte_error
-from app.core.config import get_settings, set_admin_password
+from app.core.config import get_settings, set_admin_password, set_admin_username
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +126,12 @@ async def update_user(
             status_code=status.HTTP_404_NOT_FOUND, detail="Пользователь не найден"
         )
 
+    # ``.env`` is the source of truth for one specific account, and all the checks
+    # below must look at the account being edited *before* it is renamed:
+    # renaming a user *to* the .env login must not make .env follow that account.
+    previous_username = user.username
+    is_env_admin = previous_username == get_settings().admin_username
+
     if data.username and data.username.strip() != user.username:
         existing = await db.execute(
             select(User).where(User.username == data.username.strip())
@@ -136,6 +142,15 @@ async def update_user(
                 detail="Пользователь с таким именем уже существует",
             )
         user.username = data.username.strip()
+        if is_env_admin:
+            # Keep .env in sync: without it the next start would seed a *second*
+            # admin under the old login and leave the renamed one an administrator.
+            # (Tokens of database accounts die on a rename anyway, their ``sub`` no
+            # longer matches a row.)
+            try:
+                set_admin_username(user.username)
+            except Exception as e:
+                logger.warning("Could not persist the admin username to .env: %s", e)
 
     if data.password and data.password.strip():
         pw_error = password_byte_error(data.password.strip())
@@ -150,12 +165,11 @@ async def update_user(
         # Keep .env in sync when the .env admin's own password is changed here:
         # startup seeding treats .env as the source of truth for that account, so
         # without this the change would be reverted on the next restart.
-        if user.username == get_settings().admin_username:
+        if is_env_admin:
             try:
                 set_admin_password(data.password.strip())
             except Exception as e:
                 logger.warning("Could not persist the admin password to .env: %s", e)
-
     if data.role and data.role not in ("admin", "user"):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

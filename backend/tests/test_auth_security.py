@@ -14,6 +14,7 @@
 import logging
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -27,8 +28,11 @@ from app.core.security import (  # noqa: E402
     create_access_token,
     decode_token,
     get_password_hash,
+    is_env_fallback_token,
     is_password_hash,
     password_byte_error,
+    prune_ttl_cache,
+    secret_fingerprint,
     token_version_ok,
     verify_password,
 )
@@ -111,12 +115,59 @@ def test_log_records_are_redacted():
     assert "[REDACTED]" in redact_sensitive_data("access_token=SECRET123")
 
 
+def test_env_fallback_token_is_recognised():
+    """Recovery-ветка принимает только токены, выпущенные ей самой (tv = 0)."""
+    assert is_env_fallback_token({"sub": "admin", "tv": 0}) is True
+    # Токен без claim (до появления версий) не должен оживать в recovery-ветке.
+    assert is_env_fallback_token({"sub": "admin"}) is False
+    assert is_env_fallback_token({"sub": "admin", "tv": 1}) is False
+    assert is_env_fallback_token({"sub": "admin", "tv": "мусор"}) is False
+
+
+def test_cache_keys_do_not_keep_secrets():
+    """Кэши токенов не должны хранить сам токен ни в ключе, ни в значении."""
+    token = "vk1.a.SUPERSECRET-TOKEN"
+    fingerprint = secret_fingerprint(token)
+    assert token not in fingerprint
+    assert len(fingerprint) == 32, len(fingerprint)
+    assert secret_fingerprint(token) == fingerprint
+    assert secret_fingerprint("другой-токен") != fingerprint
+    assert secret_fingerprint("") != fingerprint
+
+
+def test_ttl_cache_is_bounded():
+    """TTL сам по себе записи не удаляет — кэш подрезается при записи."""
+    cache = {}
+    for index in range(20):
+        cache[secret_fingerprint(f"token-{index}")] = (time.monotonic() - index, index)
+        prune_ttl_cache(cache, ttl=60.0, max_entries=4)
+    assert len(cache) <= 4, len(cache)
+    # Остаются самые свежие записи.
+    assert secret_fingerprint("token-0") in cache, sorted(cache)
+
+    # Просроченные записи уходят, даже если порог не превышен.
+    cache = {
+        secret_fingerprint("old"): (time.monotonic() - 120, 1),
+        secret_fingerprint("new"): (time.monotonic(), 2),
+    }
+    prune_ttl_cache(cache, ttl=60.0, max_entries=8)
+    assert len(cache) == 2, len(cache)          # порог не превышен — не трогаем
+    for index in range(10):
+        cache[secret_fingerprint(f"t{index}")] = (time.monotonic(), index)
+    prune_ttl_cache(cache, ttl=60.0, max_entries=8)
+    assert secret_fingerprint("old") not in cache
+    assert len(cache) <= 8, len(cache)
+
+
 _TESTS = [
     ("пароли: bcrypt и legacy plaintext", test_password_hashes_and_legacy_plaintext),
     ("длинные пароли: явная ошибка", test_long_passwords_are_not_truncated_silently),
     ("token_version отзывает старые JWT", test_token_version_revokes_old_tokens),
     ("секреты маскируются", test_secrets_are_masked),
     ("логи редактируются", test_log_records_are_redacted),
+    ("recovery-токен распознаётся по tv=0", test_env_fallback_token_is_recognised),
+    ("ключи кэшей не содержат секретов", test_cache_keys_do_not_keep_secrets),
+    ("кэш TTL не растёт бесконечно", test_ttl_cache_is_bounded),
 ]
 
 if __name__ == "__main__":

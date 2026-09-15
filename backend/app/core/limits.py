@@ -23,6 +23,13 @@ DEFAULT_AI_MAX_LENGTH = 5000
 MIN_ER_PERCENT = 0.0
 MAX_ER_PERCENT = 100.0
 
+# Operation limits, configurable via .env (``MAX_NEW_POSTS_PER_RUN`` /
+# ``MAX_RETRIES_PER_RUN``). The upper bounds keep a typo in .env from turning one
+# run into a several-hour job; they are shared by the settings model and the
+# processor (defence in depth).
+MAX_FETCH_POSTS_LIMIT = 10000
+MAX_RETRIES_LIMIT = 1000
+
 
 def bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     """Clamp ``value`` into ``[minimum, maximum]`` (``default`` when unusable)."""

@@ -1,9 +1,11 @@
 """Security utilities."""
 
 import bcrypt
+import hashlib
 import hmac
+import time
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Dict, Optional
 from jose import JWTError, jwt
 from app.core.config import get_settings
 
@@ -93,3 +95,46 @@ def token_version_ok(payload: dict, token_version: Optional[int]) -> bool:
     except (TypeError, ValueError):
         return False
     return issued == int(token_version or 1)
+
+
+def is_env_fallback_token(payload: dict) -> bool:
+    """Whether a JWT was minted by the ``.env``-admin recovery login.
+
+    The recovery branch of ``get_current_user`` has no database row to compare
+    ``token_version`` against (that is the whole point of the branch), so it only
+    accepts tokens that the recovery login itself issued — those carry an explicit
+    ``tv = 0``. A token without the claim (issued before token versions existed)
+    or with any other version is refused there as well, otherwise removing or
+    renaming the admin row would revive older admin tokens.
+    """
+    return payload.get("tv") == 0
+
+
+def secret_fingerprint(value: str) -> str:
+    """Short one-way fingerprint of a secret, safe to use as a cache key.
+
+    Token caches used to keep the API token itself as the dictionary key; a
+    fingerprint lets long-running processes cache results without holding the
+    secret in memory (and without it leaking through a debug dump of the cache).
+    """
+    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()[:32]
+
+
+CACHE_MAX_ENTRIES = 8
+
+
+def prune_ttl_cache(cache: Dict[str, tuple], ttl: float, max_entries: int = CACHE_MAX_ENTRIES) -> None:
+    """Drop expired (and, when needed, the oldest) entries of a TTL cache.
+
+    ``cache`` maps a fingerprint to ``(monotonic_timestamp, value)``. TTL alone
+    only stops *using* stale entries — they still accumulated forever when tokens
+    were rotated many times, so the cache is trimmed on every write.
+    """
+    if len(cache) <= max_entries:
+        return
+    now = time.monotonic()
+    for key in [key for key, entry in cache.items() if not entry or now - entry[0] >= ttl]:
+        cache.pop(key, None)
+    while len(cache) > max_entries:
+        oldest = min(cache, key=lambda key: cache[key][0])
+        cache.pop(oldest, None)

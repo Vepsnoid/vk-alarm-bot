@@ -11,6 +11,11 @@
     sudo -u www-data .venv/bin/python manage.py delete-user user1
 
 Скрипт сам переходит в свой каталог, поэтому запускать можно и по абсолютному пути.
+
+Команды ведут себя так же, как веб-панель:
+  * ``set-password``/``set-role`` отзывают ранее выданные JWT (``token_version``);
+  * последнего активного администратора нельзя понизить или удалить;
+  * ``delete-user`` переносит потоки удаляемого аккаунта другому администратору.
 """
 
 import argparse
@@ -29,15 +34,26 @@ for stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-from sqlalchemy import select  # noqa: E402
+from sqlalchemy import func, select, update  # noqa: E402
 
-from app.core.security import get_password_hash  # noqa: E402
+from app.core.security import get_password_hash, password_byte_error  # noqa: E402
 from app.models.database import AsyncSessionLocal  # noqa: E402
-from app.models.models import User  # noqa: E402
+from app.models.models import Monitor, User  # noqa: E402
+from app.services.owner_service import resolve_default_owner_id  # noqa: E402
 
 
 def _find_user(db, username):
     return select(User).where(User.username == username)
+
+
+async def _active_admins(db, exclude_id=None) -> int:
+    """How many active administrators remain (optionally excluding ``exclude_id``)."""
+    query = select(func.count()).select_from(User).where(
+        User.role == "admin", User.is_active.is_(True)
+    )
+    if exclude_id is not None:
+        query = query.where(User.id != exclude_id)
+    return (await db.execute(query)).scalar_one()
 
 
 async def list_users() -> int:
@@ -53,6 +69,11 @@ async def list_users() -> int:
 
 
 async def create_user(username: str, password: str, role: str) -> int:
+    error = password_byte_error(password)
+    if error:
+        # Как и в API: лучше отказать, чем молча усечь пароль до 72 байт.
+        print(error)
+        return 1
     async with AsyncSessionLocal() as db:
         existing = (await db.execute(_find_user(db, username))).scalar_one_or_none()
         if existing:
@@ -71,8 +92,11 @@ async def set_password(username: str, password: str) -> int:
             print(f"Пользователь '{username}' не найден")
             return 1
         user.password_hash = get_password_hash(password)
+        # Отзываем уже выданные токены: иначе украденный JWT работает ещё до 24 часов
+        # (в веб-панели версия увеличивается, CLI должен вести себя так же).
+        user.token_version = (user.token_version or 1) + 1
         await db.commit()
-    print(f"Пароль пользователя '{username}' обновлён")
+    print(f"Пароль пользователя '{username}' обновлён, выданные токены отозваны")
     return 0
 
 
@@ -82,9 +106,19 @@ async def set_role(username: str, role: str) -> int:
         if not user:
             print(f"Пользователь '{username}' не найден")
             return 1
+        if role != "admin" and user.role == "admin" and user.is_active:
+            # Та же защита, что и в веб-панели: без администратора панель недоступна.
+            if await _active_admins(db, exclude_id=user.id) == 0:
+                print(f"Отказано: '{username}' — последний активный администратор. Сначала назначьте другого.")
+                return 1
+        changed = user.role != role
         user.role = role
+        if changed:
+            # Роль и так берётся из базы на каждом запросе, но токен несёт старую роль
+            # в открытом виде: увеличиваем версию, чтобы клиент перелогинился.
+            user.token_version = (user.token_version or 1) + 1
         await db.commit()
-    print(f"Пользователь '{username}' теперь '{role}'")
+    print(f"Пользователь '{username}' теперь '{role}'" + (", выданные токены отозваны" if changed else ""))
     return 0
 
 
@@ -94,9 +128,21 @@ async def delete_user(username: str) -> int:
         if not user:
             print(f"Пользователь '{username}' не найден")
             return 1
+        if user.role == "admin" and user.is_active and await _active_admins(db, exclude_id=user.id) == 0:
+            print(f"Отказано: '{username}' — последний активный администратор. Сначала назначьте другого.")
+            return 1
+        # Потоки удаляемого аккаунта нельзя оставить без владельца — та же логика,
+        # что и в веб-панели (иначе потоки висят на несуществующем id до рестарта).
+        target_id = await resolve_default_owner_id(db)
+        reassigned = 0
+        if target_id and target_id != user.id:
+            result = await db.execute(
+                update(Monitor).where(Monitor.owner_id == user.id).values(owner_id=target_id)
+            )
+            reassigned = result.rowcount or 0
         await db.delete(user)
         await db.commit()
-    print(f"Пользователь '{username}' удалён")
+    print(f"Пользователь '{username}' удалён" + (f", потоки перенесены на пользователя id {target_id} ({reassigned})" if reassigned else ""))
     return 0
 
 

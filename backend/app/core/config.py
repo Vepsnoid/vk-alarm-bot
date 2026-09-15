@@ -8,6 +8,8 @@ from dotenv import set_key
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
+from app.core.limits import MAX_FETCH_POSTS_LIMIT, MAX_RETRIES_LIMIT
+
 _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 _PROJECT_ENV_FILE = _BACKEND_DIR.parent / ".env"
 _ENV_FILE = _PROJECT_ENV_FILE if _PROJECT_ENV_FILE.exists() else _BACKEND_DIR / ".env"
@@ -34,9 +36,12 @@ class Settings(BaseSettings):
     # How many new posts are collected per source per run. A busy news stream can
     # publish more than this between two checks; the surplus is reported in the
     # journal (see ``MAX_NEW_POSTS_PER_RUN``) instead of being dropped silently.
-    max_new_posts_per_run: int = 200
+    # Bounds are validated at startup: a typo in .env must not turn one run into a
+    # several-hour job (and ``MAX_RETRIES_PER_RUN=abc`` must not break the
+    # scheduler on every tick).
+    max_new_posts_per_run: int = Field(default=200, ge=1, le=MAX_FETCH_POSTS_LIMIT)
     # How many queued (retryable) publications are retried in a single run.
-    max_retries_per_run: int = 50
+    max_retries_per_run: int = Field(default=50, ge=1, le=MAX_RETRIES_LIMIT)
 
     class Config:
         env_file = str(_ENV_FILE)
@@ -75,6 +80,18 @@ def set_admin_password(password: str) -> None:
     Quoted so that spaces, ``#`` and dots survive the dotenv round-trip.
     """
     set_key(str(_ENV_FILE), "ADMIN_PASSWORD", password, quote_mode="always")
+    get_settings.cache_clear()
+
+
+def set_admin_username(username: str) -> None:
+    """Persist the admin login (used when the ``.env`` admin is renamed in the panel).
+
+    ``.env`` is the source of truth for that account, so the rename has to be
+    written back: otherwise the next start would seed a *second* admin under the
+    old login while the renamed account stayed an administrator.
+    """
+    set_key(str(_ENV_FILE), "ADMIN_USERNAME", username, quote_mode="always")
+    os.environ["ADMIN_USERNAME"] = username
     get_settings.cache_clear()
 
 

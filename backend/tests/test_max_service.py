@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import threading
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -17,6 +18,8 @@ import app.services.max_service as max_service  # noqa: E402
 from app.services.max_service import MaxService  # noqa: E402
 
 REQUESTS = []
+# Подписки, которые отдаёт фейковый сервер (тесты могут подменить через _subscriptions).
+SUBSCRIPTIONS = [{"chat_id": 777, "username": "mychan", "title": "Мой канал"}]
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -44,7 +47,7 @@ class _Handler(BaseHTTPRequestHandler):
             if len(gets) == 1:
                 self._respond(500, {"error": "temporary"})
                 return
-            self._respond(200, {"subscriptions": [{"chat_id": 777, "username": "mychan", "title": "Мой канал"}]})
+            self._respond(200, {"subscriptions": SUBSCRIPTIONS})
             return
         self._respond(200, {})
 
@@ -64,6 +67,18 @@ def _start_server():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, server.server_address[1]
+
+
+@contextmanager
+def _subscriptions(items):
+    """Подменить список подписок на время теста."""
+    global SUBSCRIPTIONS
+    saved = SUBSCRIPTIONS
+    SUBSCRIPTIONS = items
+    try:
+        yield
+    finally:
+        SUBSCRIPTIONS = saved
 
 
 def test_send_message_documented_shape():
@@ -101,10 +116,36 @@ def test_parse_chat_id_local_forms():
     assert REQUESTS == [], "локальные формы не должны ходить в сеть"
 
 
+def test_resolve_chat_id_prefers_exact_match():
+    """Точное совпадение названия важнее частичного."""
+    svc = MaxService(token="tok")
+    REQUESTS.clear()
+    with _subscriptions([
+        {"chat_id": 555, "title": "Новости Карелии | Официально"},
+        {"chat_id": 777, "title": "Новости Карелии"},
+    ]):
+        assert asyncio.run(svc.resolve_chat_id("Новости Карелии")) == "777"
+
+
+def test_resolve_chat_id_refuses_ambiguous_name():
+    """Частичное совпадение с несколькими чатами — отказ вместо угадывания."""
+    svc = MaxService(token="tok")
+    REQUESTS.clear()
+    with _subscriptions([
+        {"chat_id": 1, "title": "Новости Карелии"},
+        {"chat_id": 2, "title": "Новости Карелии | Официально"},
+    ]):
+        assert asyncio.run(svc.resolve_chat_id("Новости")) is None
+        # Единственное частичное совпадение по-прежнему работает.
+        assert asyncio.run(svc.resolve_chat_id("Официально")) == "2"
+
+
 _TESTS = [
     ("отправка: POST /messages?chat_id=..., без ретраев", test_send_message_documented_shape),
     ("GET ретраится на 5xx", test_get_is_retried_on_5xx),
     ("локальные формы chat_id без сети", test_parse_chat_id_local_forms),
+    ("точное имя канала важнее частичного", test_resolve_chat_id_prefers_exact_match),
+    ("неоднозначное имя канала отклоняется", test_resolve_chat_id_refuses_ambiguous_name),
 ]
 
 if __name__ == "__main__":

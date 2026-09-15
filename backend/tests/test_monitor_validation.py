@@ -83,11 +83,40 @@ def test_legacy_values_are_clamped():
     assert bounded_float(500, 100.0, 0.0, 100.0) == 100.0
 
 
+def test_operation_limits_are_validated():
+    """Лимиты из .env проверяются при старте, а не падают в планировщике."""
+    from app.core.config import Settings
+    from app.core.limits import MAX_FETCH_POSTS_LIMIT, MAX_RETRIES_LIMIT
+
+    assert Settings(max_new_posts_per_run=500).max_new_posts_per_run == 500
+    assert Settings(max_retries_per_run=1).max_retries_per_run == 1
+
+    for bad in (
+        {"max_new_posts_per_run": 0},
+        {"max_new_posts_per_run": -1},
+        {"max_new_posts_per_run": MAX_FETCH_POSTS_LIMIT + 1},
+        {"max_new_posts_per_run": "abc"},
+        {"max_retries_per_run": 0},
+        {"max_retries_per_run": MAX_RETRIES_LIMIT + 1},
+        {"max_retries_per_run": "abc"},
+    ):
+        try:
+            Settings(**bad)
+        except ValidationError:
+            continue
+        raise AssertionError(f"принято значение {bad}")
+
+    # Вторая линия защиты в процессоре: даже безумное значение обрезается.
+    assert bounded_int(1000000, 200, 1, MAX_FETCH_POSTS_LIMIT) == MAX_FETCH_POSTS_LIMIT
+    assert bounded_int(-100, 200, 1, MAX_FETCH_POSTS_LIMIT) == 1
+
+
 _TESTS = [
     ("интервал проверки: 1..1440", test_check_interval_bounds),
     ("окно ER: 0..100 и min<=max", test_er_bounds),
     ("макс. символов ИИ: 100..15000", test_ai_max_length_bounds),
     ("старые значения нормализуются", test_legacy_values_are_clamped),
+    ("лимиты прогона валидируются", test_operation_limits_are_validated),
 ]
 
 if __name__ == "__main__":

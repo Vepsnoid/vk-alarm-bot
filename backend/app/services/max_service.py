@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from app.core.security import prune_ttl_cache, secret_fingerprint
+
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://platform-api2.max.ru"
@@ -72,6 +74,11 @@ class MaxService:
         self.client = httpx.AsyncClient(timeout=30.0, verify=False, headers={"Authorization": token, "Content-Type": "application/json", "Accept": "application/json"})
         # Separate client for file uploads (Content-Type is set per request).
         self.upload_client = httpx.AsyncClient(timeout=120.0, verify=False, headers={"Authorization": token, "Accept": "application/json"})
+        # Reason of the last ``media_attachment_from_url`` failure (mirrors
+        # ``VKService.last_attachment_error``): the caller needs to know whether a
+        # missing attachment is worth retrying or is permanently unusable.
+        self.last_attachment_error: Optional[str] = None
+        self.last_attachment_transient: bool = False
 
     async def _request(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None, body: Optional[Dict[str, Any]] = None, retries: Optional[int] = None) -> Any:
         """Perform a MAX API request.
@@ -170,14 +177,24 @@ class MaxService:
         """Download a file by URL, upload it to MAX and return an attachment dict.
 
         Returns ``{"type": "image", "payload": {"token": "..."}}`` or ``None``.
+        The reason of a failure is kept in ``last_attachment_error`` together with
+        ``last_attachment_transient``: a network hiccup or a 5xx is worth retrying,
+        while an oversized/deleted file would fail identically every time.
         """
+        self.last_attachment_error = None
+        self.last_attachment_transient = False
         try:
             async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as download_client:
                 resp = await download_client.get(url)
                 resp.raise_for_status()
                 file_bytes = resp.content
-                if len(file_bytes) > max_size or len(file_bytes) < 100:
+                if len(file_bytes) > max_size:
+                    self.last_attachment_error = f"файл больше {max_size // (1024 * 1024)} МБ"
                     logger.warning("Media size unsuitable for Max (%d bytes): %s", len(file_bytes), url)
+                    return None
+                if len(file_bytes) < 100:
+                    self.last_attachment_error = "файл пустой или повреждён"
+                    logger.warning("Media looks broken for Max (%d bytes): %s", len(file_bytes), url)
                     return None
                 content_disp = resp.headers.get("content-disposition", "")
                 match = re.search(r'filename="?([^"]+)"?', content_disp)
@@ -188,9 +205,29 @@ class MaxService:
                     filename = url_path.rsplit("/", 1)[-1] or "file"
             token = await self.upload_file(file_bytes, filename)
             if not token:
+                # ``upload_file`` already retried network/5xx/429 internally, so the
+                # caller should try the whole post again later.
+                self.last_attachment_error = "загрузка файла в Max не удалась"
+                self.last_attachment_transient = True
+                logger.warning("Media upload failed for %s", url)
                 return None
             return {"type": _guess_attachment_type(filename), "payload": {"token": token}}
-        except Exception as exc:
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            # 404/403 — фото удалено/закрыто, повтор не поможет; 5xx/429 — временно.
+            self.last_attachment_error = f"HTTP {status} при скачивании"
+            self.last_attachment_transient = status >= 500 or status == 429
+            logger.warning("Failed to download media for Max from %s: HTTP %s", url, status)
+            return None
+        except httpx.RequestError as exc:
+            self.last_attachment_error = f"сеть при скачивании: {exc}"
+            self.last_attachment_transient = True
+            logger.warning("Failed to download media for Max from %s: %s", url, exc)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            self.last_attachment_error = str(exc)
+            # Неизвестная ошибка — попробуем ещё раз, хуже не будет.
+            self.last_attachment_transient = True
             logger.warning("Failed to prepare Max media from %s: %s", url, exc)
             return None
 
@@ -214,6 +251,12 @@ class MaxService:
 
         ``GET /chats`` is deprecated by MAX (since June 2026), so the documented
         ``GET /subscriptions`` listing is used instead.
+
+        An exact match (username, link tail or title) wins over a substring match:
+        with subscriptions «Новости Карелии» and «Новости Карелии | Официально» the
+        old ``name in title`` rule picked whichever the API returned first. A
+        substring that matches several chats is refused (``None``) instead of
+        guessing — the caller then logs that the target could not be recognised.
         """
         name = (channel_name or "").lower().strip()
         if not name:
@@ -223,6 +266,7 @@ class MaxService:
         except Exception as exc:
             logger.warning("Failed to list Max subscriptions: %s", exc)
             return None
+        partial: List[str] = []
         for chat in self._extract_chat_candidates(data):
             raw_id = chat.get("chat_id") or chat.get("id")
             if raw_id is None:
@@ -232,8 +276,18 @@ class MaxService:
             link = (chat.get("link") or "").lower().strip()
             link_tail = link.rstrip("/").split("/")[-1] if link else ""
             title = (chat.get("title") or "").lower().strip()
-            if name in (username, link_tail) or (title and name in title):
+            if name == username or name == link_tail or name == title:
                 return cid
+            if title and name in title:
+                partial.append(cid)
+        if len(partial) == 1:
+            return partial[0]
+        if len(partial) > 1:
+            logger.warning(
+                "Max: название '%s' неоднозначно — подходит чатов: %d. Укажите chat_id или ссылку.",
+                channel_name,
+                len(partial),
+            )
         return None
 
     async def parse_chat_id(self, channel: str) -> Optional[str]:
@@ -267,7 +321,8 @@ class MaxService:
         if not token or not token.strip():
             return None
         token = token.strip()
-        cached = cls._me_cache.get(token)
+        cache_key = secret_fingerprint(token)
+        cached = cls._me_cache.get(cache_key)
         if cached and time.monotonic() - cached[0] < cls.ME_TTL:
             return cached[1]
         info: Optional[Dict[str, Any]] = None
@@ -278,7 +333,8 @@ class MaxService:
                     info = resp.json()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Max GET /me failed: %s", exc)
-        cls._me_cache[token] = (time.monotonic(), info)
+        cls._me_cache[cache_key] = (time.monotonic(), info)
+        prune_ttl_cache(cls._me_cache, cls.ME_TTL)
         return info
 
     @staticmethod
@@ -303,11 +359,13 @@ class MaxService:
         if not token or not token.strip():
             return False
         token = token.strip()
-        cached = cls._token_cache.get(token)
+        cache_key = secret_fingerprint(token)
+        cached = cls._token_cache.get(cache_key)
         if cached and time.monotonic() - cached[0] < cls.TOKEN_TTL:
             return cached[1]
         result = await cls._validate_token_live(token)
-        cls._token_cache[token] = (time.monotonic(), result)
+        cls._token_cache[cache_key] = (time.monotonic(), result)
+        prune_ttl_cache(cls._token_cache, cls.TOKEN_TTL)
         return result
 
     @classmethod

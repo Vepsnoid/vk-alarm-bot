@@ -7,7 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.core.config import get_settings
-from app.core.security import create_access_token, verify_password, decode_token, token_version_ok
+from app.core.security import (
+    create_access_token,
+    decode_token,
+    is_env_fallback_token,
+    token_version_ok,
+    verify_password,
+)
 from app.models.database import get_db
 from app.models.models import User
 
@@ -118,10 +124,10 @@ async def get_current_user(
         }
 
     # Fallback if admin from .env (recovery mode: the DB row is missing, e.g. it was
-    # renamed/deleted). Such a token carries ``tv = 0`` and therefore cannot be
-    # revoked by ``token_version`` — it dies with its own ``exp``. Normal operation
-    # goes through the DB row created by ``seed_initial_user()``.
-    if username == settings.admin_username:
+    # renamed/deleted). Only tokens minted by the recovery login itself are accepted
+    # here (``tv = 0``): without that check, deleting the admin row would make every
+    # previously issued admin token valid again and unrevocable.
+    if username == settings.admin_username and is_env_fallback_token(payload):
         return {
             "id": 0,
             "username": settings.admin_username,

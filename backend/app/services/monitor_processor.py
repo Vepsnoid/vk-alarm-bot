@@ -21,6 +21,8 @@ from app.core.limits import (
     MAX_AI_MAX_LENGTH,
     MAX_CHECK_INTERVAL_MINUTES,
     MAX_ER_PERCENT,
+    MAX_FETCH_POSTS_LIMIT,
+    MAX_RETRIES_LIMIT,
     MIN_AI_MAX_LENGTH,
     MIN_CHECK_INTERVAL_MINUTES,
     MIN_ER_PERCENT,
@@ -50,6 +52,9 @@ MAX_PUBLISH_ATTEMPTS = 5
 # How many queued posts are retried in a single run (bound on the run duration,
 # default for ``MAX_RETRIES_PER_RUN`` in .env).
 MAX_RETRIES_PER_RUN = 50
+# Нижние границы тех же настроек (верхние — в ``core.limits``).
+MIN_FETCH_LIMIT = 1
+MIN_RETRIES_LIMIT = 1
 
 
 def _is_transient_max_error(error: Exception) -> bool:
@@ -237,7 +242,12 @@ class MonitorProcessor:
         # Operation limits are configurable via .env (MAX_NEW_POSTS_PER_RUN /
         # MAX_RETRIES_PER_RUN); the module constants stay as safe defaults.
         app_settings = get_settings()
-        fetch_limit = max(1, int(app_settings.max_new_posts_per_run or MAX_NEW_POSTS_PER_RUN))
+        fetch_limit = bounded_int(
+            app_settings.max_new_posts_per_run,
+            MAX_NEW_POSTS_PER_RUN,
+            MIN_FETCH_LIMIT,
+            MAX_FETCH_POSTS_LIMIT,
+        )
 
         last_ids = dict(monitor.last_post_ids or {})
         # The marker is set either by pausing the stream or by saving its
@@ -479,7 +489,12 @@ class MonitorProcessor:
         event in the ``pending`` state and the event row itself acts as the queue —
         drained here, oldest first, with a bounded number of attempts per post.
         """
-        retry_limit = max(1, int(get_settings().max_retries_per_run or MAX_RETRIES_PER_RUN))
+        retry_limit = bounded_int(
+            get_settings().max_retries_per_run,
+            MAX_RETRIES_PER_RUN,
+            MIN_RETRIES_LIMIT,
+            MAX_RETRIES_LIMIT,
+        )
         rows = (await db.execute(
             select(Event)
             .where(Event.monitor_id == monitor.id, Event.status == "pending")
@@ -600,14 +615,17 @@ class MonitorProcessor:
             max_service = MaxService(token=config.max_bot_token)
             try:
                 text_to_send = ai_text if ai_text else (post.get("text", "") or "(пост без текста)")
+                media_failures: list = []
                 media_error: Optional[Exception] = None
                 try:
-                    attachments = await self._build_max_attachments(max_service, monitor, post)
+                    attachments, media_failures = await self._build_max_attachments(max_service, monitor, post)
                 except Exception as e:  # noqa: BLE001
-                    # Подготовка медиа — тоже сетевой шаг: при сбое пост не должен
-                    # потеряться (и не должен уйти без своих вложений).
+                    # Неожиданный сбой подготовки медиа считаем временным: пост не
+                    # должен уйти без вложений и не должен потеряться.
                     attachments = []
                     media_error = e
+                transient_media = [f for f in media_failures if f.get("transient")]
+                permanent_media = [f for f in media_failures if not f.get("transient")]
                 if event is None:
                     # Streams without the debug log only record publications.
                     event = self._new_event(monitor, post, "failed")
@@ -646,6 +664,11 @@ class MonitorProcessor:
                     problems.append(f"не удалось подготовить медиа: {media_error}")
                     still_pending = list(target_channels)
                     await self._add_log(db, monitor.id, "error", f"Max media error for post {post.get('id')}: {media_error}")
+                elif transient_media:
+                    # Скачивание/загрузка сорвалось по сети или на 5xx: повторяем.
+                    problems.append("не удалось подготовить медиа: " + "; ".join(f["error"] for f in transient_media)[:300])
+                    still_pending = list(target_channels)
+                    await self._add_log(db, monitor.id, "warning", f"Post {post.get('id')}: медиа не подготовлено, повтор: {', '.join(f['error'] for f in transient_media)[:300]}")
                 elif not max_channels:
                     problems.append("в потоке не указан ни один Max-канал")
                 else:
@@ -673,6 +696,16 @@ class MonitorProcessor:
                             problems.append(f"{channel}: {e}")
                             still_pending.append(channel)
                             await self._add_log(db, monitor.id, "error", f"Max error for {channel}: {e}")
+
+                media_note = None
+                if permanent_media:
+                    # Файл удалён/слишком большой — повтор не поможет. Публикуем текст
+                    # с явным предупреждением вместо тихой потери вложения.
+                    media_note = "Вложения не прикреплены: " + "; ".join(
+                        f"{f['url'].rsplit('/', 1)[-1].split('?')[0]}: {f['error']}" for f in permanent_media
+                    )
+                    media_note = media_note[:400]
+                    await self._add_log(db, monitor.id, "warning", f"Post {post.get('id')}: {media_note}")
 
                 delivered = sorted(set(delivered) | set(sent_channels))
                 attempts = (event.retry_attempts or 0) + 1
@@ -704,6 +737,10 @@ class MonitorProcessor:
                             suffix = f" — попытки исчерпаны ({attempts})" if still_pending else ""
                             event.error_message = (("Не все каналы: " + detail) + suffix)[:500]
                             await self._notify_once(db, monitor, f"Ошибка отправки в Max: {monitor.name}", event.error_message)
+                        elif media_note:
+                            # Пост ушёл, но без части вложений — говорим об этом прямо.
+                            event.error_message = media_note
+                            await self._notify_once(db, monitor, f"Вложения не прикреплены: {monitor.name}", media_note)
                         else:
                             event.error_message = None
                     else:
@@ -714,6 +751,8 @@ class MonitorProcessor:
                         message = "Не отправлено: " + detail
                         if still_pending:
                             message += f" — попытки исчерпаны ({attempts})"
+                        if media_note:
+                            message += f" | {media_note}"
                         event.error_message = message[:500]
                         await self._notify_once(db, monitor, f"Ошибка отправки в Max: {monitor.name}", event.error_message)
             finally:
@@ -730,14 +769,23 @@ class MonitorProcessor:
                 return False
         return True
 
-    async def _build_max_attachments(self, max_service: MaxService, monitor: Monitor, post: dict) -> list:
-        """Copy the VK post's photos/docs to Max as ready-to-use attachments."""
+    async def _build_max_attachments(self, max_service: MaxService, monitor: Monitor, post: dict) -> tuple:
+        """Copy the VK post's photos/docs to Max as ready-to-use attachments.
+
+        Returns ``(attachments, failures)``: what can be attached right now, plus
+        the attachments that could not be prepared as
+        ``{"url", "error", "transient"}``. ``MaxService`` reports a failed
+        download/upload as ``None`` (plus ``last_attachment_error`` /
+        ``last_attachment_transient``), so the caller can tell «интернет отвалился»
+        from «файл удалён или слишком большой».
+        """
         if not self._prompt_allows_media(monitor):
-            return []
+            return [], []
         raw = post.get("attachments") or []
         if not isinstance(raw, list):
-            return []
+            return [], []
         attachments = []
+        failures = []
         for att in raw[:MAX_MEDIA_ATTACHMENTS]:
             if not isinstance(att, dict):
                 continue
@@ -754,7 +802,15 @@ class MonitorProcessor:
             media = await max_service.media_attachment_from_url(url)
             if media:
                 attachments.append(media)
-        return attachments
+            else:
+                failures.append({
+                    "url": url,
+                    "error": getattr(max_service, "last_attachment_error", None) or "не удалось подготовить вложение",
+                    # Неизвестный сбой считаем временным: одна лишняя попытка дешевле
+                    # потерянного фото.
+                    "transient": bool(getattr(max_service, "last_attachment_transient", True)),
+                })
+        return attachments, failures
 
     async def _warn_source(self, db: AsyncSession, monitor: Monitor, source: str, reason: str):
         """Report an unusable source: log it and surface it once in the UI.

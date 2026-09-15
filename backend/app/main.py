@@ -188,17 +188,29 @@ async def hash_legacy_passwords():
     """
     from app.models.database import AsyncSessionLocal
     from app.models.models import User
-    from app.core.security import get_password_hash, is_password_hash
+    from app.core.security import BCRYPT_MAX_BYTES, get_password_hash, is_password_hash
     async with AsyncSessionLocal() as db:
         rows = (await db.execute(select(User))).scalars().all()
         migrated = 0
+        truncated = []
         for user in rows:
             if user.password_hash and not is_password_hash(user.password_hash):
+                if len(user.password_hash.encode("utf-8")) > BCRYPT_MAX_BYTES:
+                    # bcrypt учитывает только первые 72 байта. Вход продолжит работать
+                    # с полным паролем (проверка усекает так же), но такую запись лучше
+                    # перевыдать: скажите пользователю сменить пароль.
+                    truncated.append(user.username)
                 user.password_hash = get_password_hash(user.password_hash)
                 migrated += 1
         if migrated:
             await db.commit()
             logger.warning("Пароли без bcrypt перехешированы: %s записей", migrated)
+        if truncated:
+            logger.warning(
+                "Пароль длиннее %s байт усечён bcrypt (попросите сменить пароль): %s",
+                BCRYPT_MAX_BYTES,
+                ", ".join(truncated),
+            )
 
 
 async def backfill_stream_owners():

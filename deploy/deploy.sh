@@ -17,10 +17,21 @@ cd "$APP_DIR"
 # Каталог принадлежит www-data, а команду запускают через sudo — без этой записи
 # git откажется работать («detected dubious ownership»).
 git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
+SCRIPT_HASH_BEFORE="$(md5sum "$0" 2>/dev/null | cut -d' ' -f1 || true)"
 git fetch --prune origin
 git checkout "$BRANCH"
 git pull --ff-only origin "$BRANCH"
 echo "    версия: $(git rev-parse --short HEAD) $(git log -1 --pretty=%s)"
+
+# Этот же git pull мог обновить сам deploy.sh, а bash уже держит старую версию
+# скрипта в памяти и дочитает её из буфера — тогда обновление прошло бы по прежней
+# логике (именно так один раз вылезло ложное «Failed to connect»). Поэтому
+# перезапускаем себя новой версией; маркер в окружении защищает от рекурсии.
+SCRIPT_HASH_AFTER="$(md5sum "$0" 2>/dev/null | cut -d' ' -f1 || true)"
+if [[ -n "${SCRIPT_HASH_BEFORE}" && "${SCRIPT_HASH_BEFORE}" != "${SCRIPT_HASH_AFTER}" && -z "${VK_ALARM_DEPLOY_REEXEC:-}" ]]; then
+  echo "==> deploy.sh обновился этим pull — перезапускаю его новой версией"
+  VK_ALARM_DEPLOY_REEXEC=1 exec bash "$0" "$@"
+fi
 
 echo "==> Ставлю зависимости Python"
 "$VENV/bin/pip" install -q --upgrade pip

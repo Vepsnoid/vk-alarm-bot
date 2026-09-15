@@ -118,6 +118,11 @@ class Event(Base):
     # Failed publications are retried from the ``pending`` state; the counter
     # bounds the retries so a broken Max setup cannot loop forever.
     retry_attempts = Column(Integer, default=0)
+    # Per-channel delivery state: ``{"sent": [...], "pending": [...]}``. A stream
+    # can target several Max chats, so a channel that failed keeps its own retry
+    # while the successful ones are never messaged twice. ``NULL`` (legacy rows)
+    # means "every channel of the stream".
+    delivery_state = Column(JSON, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
 

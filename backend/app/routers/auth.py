@@ -117,7 +117,10 @@ async def get_current_user(
             "theme_preference": user.theme_preference or "system",
         }
 
-    # Fallback if admin from .env
+    # Fallback if admin from .env (recovery mode: the DB row is missing, e.g. it was
+    # renamed/deleted). Such a token carries ``tv = 0`` and therefore cannot be
+    # revoked by ``token_version`` — it dies with its own ``exp``. Normal operation
+    # goes through the DB row created by ``seed_initial_user()``.
     if username == settings.admin_username:
         return {
             "id": 0,

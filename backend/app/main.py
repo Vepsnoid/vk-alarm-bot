@@ -131,7 +131,10 @@ async def migrate_sqlite_schema():
             "theme_preference": "VARCHAR(20) DEFAULT 'system'",
             "token_version": "INTEGER DEFAULT 1",
         },
-        "events": {"retry_attempts": "INTEGER DEFAULT 0"},
+        "events": {
+            "retry_attempts": "INTEGER DEFAULT 0",
+            "delivery_state": "JSON",
+        },
     }
     async with engine.begin() as conn:
         for table, columns in additions.items():

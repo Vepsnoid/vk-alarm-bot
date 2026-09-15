@@ -57,6 +57,10 @@ class RedactingFilter(logging.Filter):
     guarantee independent of library log levels: even a record produced by
     another library, or by a future ``logger.info(response.url)``, cannot print
     a token.
+
+    Note: this is defence in depth, not an absolute guarantee — the patterns are
+    the ones the application actually uses (``access_token=`` / ``Bearer``), so a
+    brand-new secret format must be added to ``redact_sensitive_data`` explicitly.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:

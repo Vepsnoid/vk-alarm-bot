@@ -31,10 +31,11 @@ from app.core.redaction import redact_sensitive_data
 
 logger = logging.getLogger(__name__)
 
-# Upper bound on how many new posts are pulled per source per run. Pagination
-# stops earlier as soon as already-seen (older) posts are reached. When a source
-# publishes more than this between two runs, the surplus is NOT silently dropped:
-# the run logs a warning (see ``_warn_skipped_posts``).
+# Upper bound on how many new posts are pulled per source per run (default for
+# ``MAX_NEW_POSTS_PER_RUN`` in .env). Pagination stops earlier as soon as
+# already-seen (older) posts are reached. When a source publishes more than this
+# between two runs, the surplus is NOT silently dropped: the run logs a warning
+# (see ``_warn_skipped_posts``).
 MAX_NEW_POSTS_PER_RUN = 200
 # Upper bound on media attachments forwarded for a single post.
 MAX_MEDIA_ATTACHMENTS = 10
@@ -46,7 +47,8 @@ MAX_LOGGED_EVENTS_PER_STREAM = 2000
 # broken Max setup does not loop forever — the post then shows up in «События»
 # as ``failed`` with the reason.
 MAX_PUBLISH_ATTEMPTS = 5
-# How many queued posts are retried in a single run (bounds the run duration).
+# How many queued posts are retried in a single run (bound on the run duration,
+# default for ``MAX_RETRIES_PER_RUN`` in .env).
 MAX_RETRIES_PER_RUN = 50
 
 
@@ -232,6 +234,11 @@ class MonitorProcessor:
             monitor.ai_max_length, DEFAULT_AI_MAX_LENGTH, MIN_AI_MAX_LENGTH, MAX_AI_MAX_LENGTH
         )
 
+        # Operation limits are configurable via .env (MAX_NEW_POSTS_PER_RUN /
+        # MAX_RETRIES_PER_RUN); the module constants stay as safe defaults.
+        app_settings = get_settings()
+        fetch_limit = max(1, int(app_settings.max_new_posts_per_run or MAX_NEW_POSTS_PER_RUN))
+
         last_ids = dict(monitor.last_post_ids or {})
         # The marker is set either by pausing the stream or by saving its
         # settings ("fresh start"): in both cases this run re-initialises the
@@ -271,7 +278,7 @@ class MonitorProcessor:
                 last_id = last_ids.get(str(owner_id))
                 fetch_stats: dict = {}
                 posts = await self.vk.get_posts_since_last(
-                    owner_id, last_id, max_posts=MAX_NEW_POSTS_PER_RUN, stats=fetch_stats
+                    owner_id, last_id, max_posts=fetch_limit, stats=fetch_stats
                 )
                 # Posts older than the newest MAX_NEW_POSTS_PER_RUN ones cannot be
                 # reached any more once the cursor moves: report them (see below).
@@ -306,10 +313,10 @@ class MonitorProcessor:
                 await self._add_log(db, monitor.id, "info", f"Прогресс: {index}/{total_sources} источников")
                 await db.commit()
         if skipped_posts:
-            # Explicit policy for a burst: the newest MAX_NEW_POSTS_PER_RUN posts
-            # per source are processed, the older ones cannot be reached once the
-            # cursor moves past them — so say so instead of losing them silently.
-            await self._warn_skipped_posts(db, monitor, skipped_posts)
+            # Explicit policy for a burst: the newest fetch_limit posts per source
+            # are processed, the older ones cannot be reached once the cursor moves
+            # past them — so say so instead of losing them silently.
+            await self._warn_skipped_posts(db, monitor, skipped_posts, fetch_limit)
         # Optional debug log: one row per parsed post so the UI can show which
         # ones were dropped by keywords/ER and which reached Max.
         post_events: dict = {}
@@ -472,11 +479,12 @@ class MonitorProcessor:
         event in the ``pending`` state and the event row itself acts as the queue —
         drained here, oldest first, with a bounded number of attempts per post.
         """
+        retry_limit = max(1, int(get_settings().max_retries_per_run or MAX_RETRIES_PER_RUN))
         rows = (await db.execute(
             select(Event)
             .where(Event.monitor_id == monitor.id, Event.status == "pending")
             .order_by(Event.original_date.is_(None), Event.original_date.asc(), Event.id.asc())
-            .limit(MAX_RETRIES_PER_RUN)
+            .limit(retry_limit)
         )).scalars().all()
         if not rows:
             return
@@ -547,12 +555,13 @@ class MonitorProcessor:
             return None, stored[len(prefix):]
         return None, None
 
-    async def _warn_skipped_posts(self, db: AsyncSession, monitor: Monitor, skipped: int) -> None:
-        """Report a burst that did not fit into ``MAX_NEW_POSTS_PER_RUN``."""
+    async def _warn_skipped_posts(self, db: AsyncSession, monitor: Monitor, skipped: int, limit: int) -> None:
+        """Report a burst that did not fit into the per-run fetch limit."""
         message = (
             f"Всплеск публикаций: не менее {skipped} самых старых постов не обработаны — "
-            f"за прогон берётся не более {MAX_NEW_POSTS_PER_RUN} новых постов на источник. "
-            "Уменьшите периодичность проверки потока, чтобы успевать за публикациями."
+            f"за прогон берётся не более {limit} новых постов на источник. "
+            "Уменьшите периодичность проверки потока (или увеличьте MAX_NEW_POSTS_PER_RUN в .env), "
+            "чтобы успевать за публикациями."
         )
         await self._add_log(db, monitor.id, "warning", message)
         await self._notify_once(db, monitor, f"Пропущены посты: {monitor.name}", message)
@@ -613,73 +622,100 @@ class MonitorProcessor:
                     event.ai_analysis_result = f"Ошибка ИИ: {ai_error}"
                 await db.flush()
 
-                # A post counts as sent only when at least one channel really
-                # accepted it: an unconfigured or unrecognised channel must not
-                # produce a "sent" event nor inflate the published counter.
+                # Delivery state per channel: a stream can target several Max chats,
+                # and a channel that failed must keep its own retry instead of being
+                # masked by the successful ones. ``delivery_state`` holds
+                # ``{"sent": [...], "pending": [...]}``; legacy rows (``None``) mean
+                # "every channel of the stream".
+                state = event.delivery_state if isinstance(event.delivery_state, dict) else {}
+                delivered: list = [c for c in (state.get("sent") or []) if isinstance(c, str)]
+                stored_pending = state.get("pending")
+                if isinstance(stored_pending, list):
+                    # Only the channels that still owe this post are retried.
+                    target_channels = [c for c in stored_pending if isinstance(c, str)]
+                else:
+                    target_channels = list(max_channels)
+                previously_delivered = bool(delivered)
+
                 sent_channels: list = []
+                still_pending: list = []
                 problems: list = []
-                # ``retryable`` stays True while every reason is transient (network
-                # hiccup, HTTP 5xx, rate limit): such a post is retried by the next
-                # runs instead of being lost. A missing/mistyped channel or a 4xx
-                # answer would repeat identically, so those posts are not queued.
-                retryable = True
                 if media_error is not None:
+                    # Вложения не подготовились: каналы не трогаем, пост ждёт повтора —
+                    # публиковать его без медиа нельзя.
                     problems.append(f"не удалось подготовить медиа: {media_error}")
+                    still_pending = list(target_channels)
                     await self._add_log(db, monitor.id, "error", f"Max media error for post {post.get('id')}: {media_error}")
                 elif not max_channels:
-                    retryable = False
                     problems.append("в потоке не указан ни один Max-канал")
-                # При сбое подготовки медиа каналы не трогаем: пост ждёт повтора.
-                for channel in ([] if media_error is not None else max_channels):
-                    try:
-                        chat_id = await max_service.parse_chat_id(channel)
-                        if not chat_id:
-                            retryable = False
-                            problems.append(f"канал '{channel}' не распознан")
-                            await self._add_log(db, monitor.id, "warning", f"Не отправлено: канал '{channel}' не распознан (нужен chat_id или ссылка вида https://max.ru/chat/123)")
-                            continue
-                        await max_service.send_post_to_chat(chat_id, text_to_send, original_url=post.get("url"), attachments=attachments)
-                        sent_channels.append(channel)
-                        await self._add_log(db, monitor.id, "info", f"Post {post['id']} sent to Max channel {channel}")
-                    except MaxBotError as e:
-                        monitor.publication_errors += 1
-                        if not _is_transient_max_error(e):
-                            retryable = False
-                        problems.append(f"{channel}: {e}")
-                        await self._add_log(db, monitor.id, "error", f"Max publish error for {channel}: {e}")
-                    except Exception as e:
-                        monitor.publication_errors += 1
-                        # Anything unexpected (no ``status_code``) counts as
-                        # transient and is retried a few times.
-                        retryable = retryable and _is_transient_max_error(e)
-                        problems.append(f"{channel}: {e}")
-                        await self._add_log(db, monitor.id, "error", f"Max error for {channel}: {e}")
-
-                if sent_channels:
-                    event.status = "sent"
-                    event.sent_at = datetime.utcnow()
-                    event.retry_attempts = 0
-                    event.error_message = (("Не все каналы: " + "; ".join(problems))[:500] if problems else None)
-                    monitor.posts_published += 1
-                    if event.error_message:
-                        await self._notify_once(db, monitor, f"Ошибка отправки в Max: {monitor.name}", event.error_message)
                 else:
-                    attempts = (event.retry_attempts or 0) + 1
+                    for channel in target_channels:
+                        try:
+                            chat_id = await max_service.parse_chat_id(channel)
+                            if not chat_id:
+                                # Нераспознанный канал не станет валидным сам по себе:
+                                # повторять его бессмысленно (ошибка конфигурации).
+                                problems.append(f"канал '{channel}' не распознан")
+                                await self._add_log(db, monitor.id, "warning", f"Не отправлено: канал '{channel}' не распознан (нужен chat_id или ссылка вида https://max.ru/chat/123)")
+                                continue
+                            await max_service.send_post_to_chat(chat_id, text_to_send, original_url=post.get("url"), attachments=attachments)
+                            sent_channels.append(channel)
+                            await self._add_log(db, monitor.id, "info", f"Post {post['id']} sent to Max channel {channel}")
+                        except MaxBotError as e:
+                            monitor.publication_errors += 1
+                            problems.append(f"{channel}: {e}")
+                            # Сеть/5xx/429 повторим, 4xx повторится с тем же ответом.
+                            if _is_transient_max_error(e):
+                                still_pending.append(channel)
+                            await self._add_log(db, monitor.id, "error", f"Max publish error for {channel}: {e}")
+                        except Exception as e:
+                            monitor.publication_errors += 1
+                            problems.append(f"{channel}: {e}")
+                            still_pending.append(channel)
+                            await self._add_log(db, monitor.id, "error", f"Max error for {channel}: {e}")
+
+                delivered = sorted(set(delivered) | set(sent_channels))
+                attempts = (event.retry_attempts or 0) + 1
+                # Channels that still owe this post: retried until MAX_PUBLISH_ATTEMPTS.
+                retry_channels = sorted(set(still_pending)) if (still_pending and attempts < MAX_PUBLISH_ATTEMPTS) else []
+                event.delivery_state = {"sent": delivered, "pending": retry_channels}
+                if sent_channels and not previously_delivered:
+                    # A post is counted as published once, even when the remaining
+                    # channels are delivered by a later retry.
+                    monitor.posts_published += 1
+                if delivered:
+                    event.sent_at = event.sent_at or datetime.utcnow()
+
+                detail = "; ".join(problems)
+                if retry_channels:
+                    # Kept for the next runs (see ``_retry_pending_events``): only the
+                    # channels below are messaged again, the successful ones are not.
+                    event.status = "pending"
                     event.retry_attempts = attempts
-                    event.sent_at = None
-                    detail = "Не отправлено: " + "; ".join(problems)
-                    if retryable and attempts < MAX_PUBLISH_ATTEMPTS:
-                        # Keep the post for the next runs (see ``_retry_pending_events``)
-                        # instead of losing it: the cursor has already moved on.
-                        event.status = "pending"
-                        event.error_message = detail[:500]
-                        await self._add_log(db, monitor.id, "warning", f"Post {post['id']} не отправлен, попытка {attempts}/{MAX_PUBLISH_ATTEMPTS}: остаётся в очереди")
-                    else:
-                        event.status = "failed"
-                        if retryable:
-                            detail += f" — попытки исчерпаны ({attempts})"
-                        event.error_message = detail[:500]
+                    prefix = "Не все каналы: " if delivered else "Не отправлено: "
+                    event.error_message = (prefix + detail)[:500]
+                    await self._add_log(db, monitor.id, "warning", f"Post {post['id']}: повтор для {', '.join(retry_channels)} (попытка {attempts}/{MAX_PUBLISH_ATTEMPTS})")
                     await self._notify_once(db, monitor, f"Ошибка отправки в Max: {monitor.name}", event.error_message)
+                else:
+                    if delivered:
+                        event.retry_attempts = 0
+                        event.status = "sent"
+                        if problems:
+                            suffix = f" — попытки исчерпаны ({attempts})" if still_pending else ""
+                            event.error_message = (("Не все каналы: " + detail) + suffix)[:500]
+                            await self._notify_once(db, monitor, f"Ошибка отправки в Max: {monitor.name}", event.error_message)
+                        else:
+                            event.error_message = None
+                    else:
+                        # Nothing was delivered: keep the attempt counter so the event
+                        # shows how many times it was tried.
+                        event.retry_attempts = attempts
+                        event.status = "failed"
+                        message = "Не отправлено: " + detail
+                        if still_pending:
+                            message += f" — попытки исчерпаны ({attempts})"
+                        event.error_message = message[:500]
+                        await self._notify_once(db, monitor, f"Ошибка отправки в Max: {monitor.name}", event.error_message)
             finally:
                 await max_service.aclose()
 

@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     gigachat_scope: str = "GIGACHAT_API_PERS"
     gigachat_model: str = "GigaChat"
     max_bot_token: str = ""
+    # How many new posts are collected per source per run. A busy news stream can
+    # publish more than this between two checks; the surplus is reported in the
+    # journal (see ``MAX_NEW_POSTS_PER_RUN``) instead of being dropped silently.
+    max_new_posts_per_run: int = 200
+    # How many queued (retryable) publications are retried in a single run.
+    max_retries_per_run: int = 50
 
     class Config:
         env_file = str(_ENV_FILE)

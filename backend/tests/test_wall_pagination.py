@@ -100,12 +100,32 @@ def test_first_run_baseline():
     assert len(posts2) == 30, f"первый запуск должен ограничиваться 30, получено {len(posts2)}"
 
 
+def test_burst_over_cap_is_reported():
+    """Переполнение лимита max_posts видно в stats (иначе посты теряются молча)."""
+    order = [_post(pid) for pid in range(300, 0, -1)]  # ids 300..1, все новее курсора
+    vk, calls = _make_vk(order)
+    stats = {}
+    posts = asyncio.run(vk.get_posts_since_last(OWNER, last_id=0, max_posts=200, stats=stats))
+    assert len(posts) == 200, len(posts)
+    assert max(p["id"] for p in posts) == 300
+    assert stats["fetched"] == 200, stats
+    assert stats["skipped"] == 100, stats
+
+    # Без переполнения предупреждать не о чем.
+    vk2, _ = _make_vk(order)
+    stats2 = {}
+    posts2 = asyncio.run(vk2.get_posts_since_last(OWNER, last_id=250, max_posts=200, stats=stats2))
+    assert len(posts2) == 50, len(posts2)
+    assert stats2["skipped"] == 0, stats2
+
+
 _TESTS = [
     ("всплеск больше страницы: без пропусков", test_burst_larger_than_page),
     ("страница целиком старая: остановка", test_whole_page_old_stops),
     ("монотонная лента: одна страница", test_monotonic_single_page),
     ("закреплённый старый пост пропускается", test_pinned_old_skipped),
     ("первый запуск: базовая страница", test_first_run_baseline),
+    ("переполнение лимита сообщается в stats", test_burst_over_cap_is_reported),
 ]
 
 if __name__ == "__main__":

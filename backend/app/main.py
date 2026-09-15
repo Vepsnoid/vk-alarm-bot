@@ -7,6 +7,7 @@ from fastapi.responses import FileResponse
 import asyncio
 import logging
 import os
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 # httpx logs full request URLs at INFO level, which would leak access tokens
@@ -14,6 +15,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+# Defence in depth: even if some library (or a future log statement) prints a
+# URL/token, the filter rewrites it before it reaches the file. Uvicorn logs its
+# access lines on dedicated loggers (``propagate = False``), so they are patched
+# explicitly.
+from app.core.redaction import install_log_redaction  # noqa: E402
+
+install_log_redaction(
+    logging.getLogger(),
+    logging.getLogger("uvicorn"),
+    logging.getLogger("uvicorn.error"),
+    logging.getLogger("uvicorn.access"),
+)
 
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -113,7 +127,11 @@ async def migrate_sqlite_schema():
             "copy_media": "BOOLEAN DEFAULT 1",
             "log_all_posts": "BOOLEAN DEFAULT 0",
         },
-        "users": {"theme_preference": "VARCHAR(20) DEFAULT 'system'"},
+        "users": {
+            "theme_preference": "VARCHAR(20) DEFAULT 'system'",
+            "token_version": "INTEGER DEFAULT 1",
+        },
+        "events": {"retry_attempts": "INTEGER DEFAULT 0"},
     }
     async with engine.begin() as conn:
         for table, columns in additions.items():
@@ -138,6 +156,28 @@ async def redact_stored_secrets():
                     if redacted != value:
                         setattr(record, field, redacted)
         await db.commit()
+
+
+async def hash_legacy_passwords():
+    """Rewrite legacy plaintext passwords as bcrypt hashes.
+
+    ``verify_password`` still accepts a non-hash value, but only so that
+    ``ADMIN_PASSWORD`` from ``.env`` can be compared; rows in the database must
+    never keep a readable password.
+    """
+    from app.models.database import AsyncSessionLocal
+    from app.models.models import User
+    from app.core.security import get_password_hash, is_password_hash
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(select(User))).scalars().all()
+        migrated = 0
+        for user in rows:
+            if user.password_hash and not is_password_hash(user.password_hash):
+                user.password_hash = get_password_hash(user.password_hash)
+                migrated += 1
+        if migrated:
+            await db.commit()
+            logger.warning("Пароли без bcrypt перехешированы: %s записей", migrated)
 
 
 async def backfill_stream_owners():
@@ -214,6 +254,7 @@ async def lifespan(app: FastAPI):
     await normalize_stored_lists()
     await redact_stored_secrets()
     await seed_initial_user()
+    await hash_legacy_passwords()
     await backfill_stream_owners()
 
     scheduler.add_job(run_scheduled_monitors, trigger=IntervalTrigger(seconds=DISPATCHER_TICK_SECONDS, jitter=10), id="monitor_dispatcher", replace_existing=True)
@@ -244,17 +285,46 @@ async def health_check():
 # NOTE: keep the SPA catch-all route *after* all API routes, otherwise it would
 # swallow requests such as /api/health and return index.html instead of JSON.
 frontend_dist = os.path.join(os.path.dirname(__file__), "../../frontend/dist")
+
+
+def resolve_frontend_file(full_path: str) -> Optional[str]:
+    """Resolve a request path inside ``frontend/dist`` (``None`` when unsafe).
+
+    ``os.path.join`` happily accepts ``../..`` (and on Windows also backslashes),
+    which used to let a crafted request (``/../../.env``, ``/%2e%2e/%2e%2e/.env``)
+    read files outside the SPA directory — including ``.env`` with all the
+    tokens. Only files that stay inside the (resolved) dist directory are served;
+    everything else falls back to ``index.html``.
+    """
+    if not full_path:
+        return None
+    # Treat backslashes as separators: on Windows they would otherwise be passed
+    # through to the filesystem as a valid separator.
+    candidate = os.path.realpath(os.path.join(frontend_dist, full_path.replace("\\", "/")))
+    root = os.path.realpath(frontend_dist)
+    try:
+        if os.path.commonpath([candidate, root]) != root:
+            return None
+    except ValueError:
+        # Different drives (Windows) — definitely outside the SPA directory.
+        return None
+    if os.path.isfile(candidate):
+        return candidate
+    return None
+
+
 if os.path.exists(frontend_dist):
     app.mount("/assets", StaticFiles(directory=os.path.join(frontend_dist, "assets")), name="assets")
+    index_file = os.path.join(frontend_dist, "index.html")
     @app.get("/")
     async def serve_index():
-        return FileResponse(os.path.join(frontend_dist, "index.html"))
+        return FileResponse(index_file)
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
         # Never serve the SPA for API paths; let FastAPI return a proper 404 JSON.
         if full_path == "api" or full_path.startswith("api/"):
             raise HTTPException(status_code=404, detail="Not Found")
-        file_path = os.path.join(frontend_dist, full_path)
-        if os.path.exists(file_path) and os.path.isfile(file_path):
+        file_path = resolve_frontend_file(full_path)
+        if file_path:
             return FileResponse(file_path)
-        return FileResponse(os.path.join(frontend_dist, "index.html"))
+        return FileResponse(index_file)

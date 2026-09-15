@@ -41,13 +41,20 @@ export default function Settings() {
 
   const isAdmin = currentUser?.role === 'admin'
 
+  // The API sends a placeholder (``••••1234``) instead of the stored secrets, so
+  // an untouched field must not be submitted back — otherwise the placeholder
+  // would overwrite the real value.
+  const isMaskedSecret = (value: string) => !!value && value.startsWith('••••')
+
   useEffect(() => { fetchSettings(); fetchMe() }, [])
 
   const fetchMe = async () => { try { const r = await api.get('/auth/me'); setCurrentUser(r.data); if (r.data.role === 'admin') fetchUsers() } catch {} }
   const loadModels = async (opts?: { provider?: string; api_base?: string; api_key?: string }) => {
     setLoadingModels(true); setModelsError('')
     try {
-      const r = await api.post('/settings/ai/models', { ai_provider: opts?.provider ?? settings.ai_provider, ai_api_base: opts?.api_base ?? settings.ai_api_base, ai_api_key: opts?.api_key ?? settings.ai_api_key })
+      // A placeholder (``••••1234``) is not a key: let the backend use the stored one.
+      const apiKey = opts?.api_key ?? settings.ai_api_key
+      const r = await api.post('/settings/ai/models', { ai_provider: opts?.provider ?? settings.ai_provider, ai_api_base: opts?.api_base ?? settings.ai_api_base, ai_api_key: isMaskedSecret(apiKey) ? undefined : apiKey })
       if (r.data.ok) { setModels(r.data.models || []); if (!(r.data.models || []).length) setModelsError('Список моделей пуст') }
       else { setModels([]); setModelsError(r.data.error || 'Не удалось получить список моделей') }
     } catch (err: any) { setModels([]); setModelsError(err.response?.data?.detail || 'Ошибка загрузки моделей') } finally { setLoadingModels(false) }
@@ -63,7 +70,15 @@ export default function Settings() {
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault(); setSaving(true)
-    try { await api.put('/settings', { vk_service_token: settings.vk_service_token, max_bot_token: settings.max_bot_token, ai_api_key: settings.ai_api_key, ai_provider: settings.ai_provider, ai_model: settings.ai_model, ai_api_base: settings.ai_api_base }); setSaved(true); setTimeout(() => setSaved(false), 3000); fetchSettings() } catch (err: any) { alert(err.response?.data?.detail || 'Ошибка') }
+    try {
+      // Only real, changed secrets are submitted (see ``isMaskedSecret``); the rest
+      // of the values are always sent.
+      const payload: Record<string, string> = { ai_provider: settings.ai_provider, ai_model: settings.ai_model, ai_api_base: settings.ai_api_base }
+      if (settings.vk_service_token && !isMaskedSecret(settings.vk_service_token)) payload.vk_service_token = settings.vk_service_token
+      if (settings.max_bot_token && !isMaskedSecret(settings.max_bot_token)) payload.max_bot_token = settings.max_bot_token
+      if (settings.ai_api_key && !isMaskedSecret(settings.ai_api_key)) payload.ai_api_key = settings.ai_api_key
+      await api.put('/settings', payload); setSaved(true); setTimeout(() => setSaved(false), 3000); fetchSettings()
+    } catch (err: any) { alert(err.response?.data?.detail || 'Ошибка') }
     finally { setSaving(false) }
   }
 

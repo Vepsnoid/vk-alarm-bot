@@ -11,7 +11,7 @@ from app.models.database import get_db
 from app.models.models import Monitor, User
 from app.routers.auth import get_current_user
 from app.services.owner_service import resolve_default_owner_id
-from app.core.security import get_password_hash
+from app.core.security import get_password_hash, password_byte_error
 from app.core.config import get_settings, set_admin_password
 
 logger = logging.getLogger(__name__)
@@ -78,6 +78,12 @@ async def create_user(
             detail="Имя пользователя и пароль не могут быть пустыми",
         )
 
+    pw_error = password_byte_error(data.password)
+    if pw_error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=pw_error
+        )
+
     if data.role not in ("admin", "user"):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -132,7 +138,15 @@ async def update_user(
         user.username = data.username.strip()
 
     if data.password and data.password.strip():
+        pw_error = password_byte_error(data.password.strip())
+        if pw_error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=pw_error
+            )
         user.password_hash = get_password_hash(data.password.strip())
+        # A new password must kill the sessions issued with the old one: the JWT
+        # lifetimes (24 h) are otherwise wide open for a stolen token.
+        user.token_version = (user.token_version or 1) + 1
         # Keep .env in sync when the .env admin's own password is changed here:
         # startup seeding treats .env as the source of truth for that account, so
         # without this the change would be reverted on the next restart.

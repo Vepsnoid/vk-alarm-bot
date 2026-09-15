@@ -1,6 +1,7 @@
 """Monitor processing service - parses VK posts, analyzes with AI, sends to Max."""
 
 import asyncio
+import ast
 import logging
 import random
 from datetime import datetime, timedelta
@@ -14,17 +15,53 @@ from app.services.max_service import MaxService, MaxBotError
 from app.services.notification_service import NotificationService
 from app.models.database import AsyncSessionLocal
 from app.core.config import get_settings
+from app.core.limits import (
+    DEFAULT_AI_MAX_LENGTH,
+    DEFAULT_CHECK_INTERVAL_MINUTES,
+    MAX_AI_MAX_LENGTH,
+    MAX_CHECK_INTERVAL_MINUTES,
+    MAX_ER_PERCENT,
+    MIN_AI_MAX_LENGTH,
+    MIN_CHECK_INTERVAL_MINUTES,
+    MIN_ER_PERCENT,
+    bounded_float,
+    bounded_int,
+)
 from app.core.redaction import redact_sensitive_data
 
 logger = logging.getLogger(__name__)
 
 # Upper bound on how many new posts are pulled per source per run. Pagination
-# stops earlier as soon as already-seen (older) posts are reached.
+# stops earlier as soon as already-seen (older) posts are reached. When a source
+# publishes more than this between two runs, the surplus is NOT silently dropped:
+# the run logs a warning (see ``_warn_skipped_posts``).
 MAX_NEW_POSTS_PER_RUN = 200
 # Upper bound on media attachments forwarded for a single post.
 MAX_MEDIA_ATTACHMENTS = 10
 # How many events are kept per stream when the full pipeline log is enabled.
 MAX_LOGGED_EVENTS_PER_STREAM = 2000
+# A publication that failed for a *transient* reason (network, 5xx, rate limit)
+# is kept as a ``pending`` event and retried by the following runs, so an outage
+# cannot silently swallow posts. The counter stops the retries, so a permanently
+# broken Max setup does not loop forever — the post then shows up in «События»
+# as ``failed`` with the reason.
+MAX_PUBLISH_ATTEMPTS = 5
+# How many queued posts are retried in a single run (bounds the run duration).
+MAX_RETRIES_PER_RUN = 50
+
+
+def _is_transient_max_error(error: Exception) -> bool:
+    """Whether a Max failure is worth retrying.
+
+    ``MaxBotError.status_code`` is 0 for network problems (and for errors without
+    an HTTP status), 5xx/429 when the service is temporarily unavailable. A 4xx
+    answer means the request itself is wrong (bad token, the bot is not a member,
+    the message was rejected) — repeating it would produce the same answer.
+    """
+    status = getattr(error, "status_code", 0) or 0
+    if status == 0:
+        return True
+    return status >= 500 or status == 429
 
 
 class MonitorProcessor:
@@ -40,7 +77,6 @@ class MonitorProcessor:
 
     # Phrases in the AI prompt that disable media forwarding.
     _NO_MEDIA_MARKERS = ("без медиа", "без вложений", "без картинок", "без фото", "без видео", "только текст", "text only", "no media")
-
     def __init__(self):
         self.vk = VKService()
         self.ai = AIService()
@@ -72,7 +108,16 @@ class MonitorProcessor:
                     now = datetime.utcnow()
                     due_ids = []
                     for monitor in monitors:
-                        interval = monitor.check_interval_minutes or default_interval_minutes or 15
+                        # Bounds are enforced again here: rows saved by an older
+                        # version (the API had no validation) may hold a 0 or
+                        # negative interval, which would make the stream «due» on
+                        # every scheduler tick and hammer the VK API.
+                        interval = bounded_int(
+                            monitor.check_interval_minutes or default_interval_minutes,
+                            DEFAULT_CHECK_INTERVAL_MINUTES,
+                            MIN_CHECK_INTERVAL_MINUTES,
+                            MAX_CHECK_INTERVAL_MINUTES,
+                        )
                         if monitor.last_run_at is None or (now - monitor.last_run_at) >= timedelta(minutes=interval):
                             due_ids.append(monitor.id)
 
@@ -176,12 +221,27 @@ class MonitorProcessor:
         if not sources:
             return
 
+        # Normalise the numeric settings: rows saved before the API validated them
+        # can hold out-of-range values (a negative interval, an inverted ER window
+        # that would drop every post for good, a negative AI length limit).
+        min_er = bounded_float(monitor.min_er, MIN_ER_PERCENT, MIN_ER_PERCENT, MAX_ER_PERCENT)
+        max_er = bounded_float(monitor.max_er, MAX_ER_PERCENT, MIN_ER_PERCENT, MAX_ER_PERCENT)
+        if min_er > max_er:
+            min_er, max_er = max_er, min_er
+        ai_max_length = bounded_int(
+            monitor.ai_max_length, DEFAULT_AI_MAX_LENGTH, MIN_AI_MAX_LENGTH, MAX_AI_MAX_LENGTH
+        )
+
         last_ids = dict(monitor.last_post_ids or {})
         # The marker is set either by pausing the stream or by saving its
         # settings ("fresh start"): in both cases this run re-initialises the
         # cursors below, so the backlog collected so far is not published.
         skip_backlog = monitor.paused_at is not None and monitor.is_active
         all_new_posts = []
+        # New posts that did not fit into MAX_NEW_POSTS_PER_RUN (see
+        # ``_warn_skipped_posts``): counted so the run can report them instead of
+        # dropping them silently.
+        skipped_posts = 0
 
         total_sources = len(sources)
         progress_every = 25
@@ -209,7 +269,13 @@ class MonitorProcessor:
                 # errors with a hint, and skipping the extra call nearly halves the
                 # VK requests spent per source on every run.
                 last_id = last_ids.get(str(owner_id))
-                posts = await self.vk.get_posts_since_last(owner_id, last_id, max_posts=MAX_NEW_POSTS_PER_RUN)
+                fetch_stats: dict = {}
+                posts = await self.vk.get_posts_since_last(
+                    owner_id, last_id, max_posts=MAX_NEW_POSTS_PER_RUN, stats=fetch_stats
+                )
+                # Posts older than the newest MAX_NEW_POSTS_PER_RUN ones cannot be
+                # reached any more once the cursor moves: report them (see below).
+                skipped_posts += int(fetch_stats.get("skipped") or 0)
 
                 if last_id is None or skip_backlog:
                     # Initialise the cursor and do not publish the history.
@@ -239,6 +305,11 @@ class MonitorProcessor:
                 # Visible progress for streams with hundreds of sources.
                 await self._add_log(db, monitor.id, "info", f"Прогресс: {index}/{total_sources} источников")
                 await db.commit()
+        if skipped_posts:
+            # Explicit policy for a burst: the newest MAX_NEW_POSTS_PER_RUN posts
+            # per source are processed, the older ones cannot be reached once the
+            # cursor moves past them — so say so instead of losing them silently.
+            await self._warn_skipped_posts(db, monitor, skipped_posts)
         # Optional debug log: one row per parsed post so the UI can show which
         # ones were dropped by keywords/ER and which reached Max.
         post_events: dict = {}
@@ -252,7 +323,7 @@ class MonitorProcessor:
         # Apply keyword / minus-word / ER filters (pre-AI)
         passed_posts = []
         for post in all_new_posts:
-            filter_ok, category, detail = self.vk.check_filters(post["text"], keywords, minus_words, monitor.min_er, monitor.max_er, post["likes"], post["reposts"], post["comments"], post["views"])
+            filter_ok, category, detail = self.vk.check_filters(post["text"], keywords, minus_words, min_er, max_er, post["likes"], post["reposts"], post["comments"], post["views"])
             if not filter_ok:
                 if category == "er":
                     monitor.posts_filtered_er += 1
@@ -295,7 +366,7 @@ class MonitorProcessor:
                     post.get("text", ""),
                     monitor.ai_prompt,
                     monitor.ai_tone,
-                    monitor.ai_max_length,
+                    ai_max_length,
                     monitor.ai_fallback_to_original,
                 )
                 if ok:
@@ -362,6 +433,10 @@ class MonitorProcessor:
         # consumed by the runner from a freshly read row, so a marker the user set
         # while this run was in progress survives for the queued run.
 
+        # Retry the posts kept from previous runs (transient Max failures) before
+        # sending the fresh batch: a short outage must not lose publications.
+        await self._retry_pending_events(db, monitor)
+
         # Publish oldest -> newest (chronological order).
         ready_posts.sort(key=lambda item: (item[0].get("date") or datetime.min, int(item[0].get("id") or 0)))
 
@@ -373,14 +448,114 @@ class MonitorProcessor:
             # Keep transactions short here as well.
             await db.commit()
 
-        # Keep the debug log bounded per stream.
+        # Keep the debug log bounded per stream. ``pending`` rows are never pruned:
+        # they are still waiting for a successful publication.
         if monitor.log_all_posts:
             keep_ids = (await db.execute(
                 select(Event.id).where(Event.monitor_id == monitor.id).order_by(Event.id.desc()).limit(MAX_LOGGED_EVENTS_PER_STREAM)
             )).scalars().all()
             if keep_ids:
-                await db.execute(delete(Event).where(Event.monitor_id == monitor.id, Event.id.notin_(keep_ids)))
+                await db.execute(delete(Event).where(
+                    Event.monitor_id == monitor.id,
+                    Event.status != "pending",
+                    Event.id.notin_(keep_ids),
+                ))
 
+        await db.commit()
+
+    async def _retry_pending_events(self, db: AsyncSession, monitor: Monitor) -> None:
+        """Re-send the posts whose publication failed for a transient reason.
+
+        The cursor moves past a post as soon as it is collected, so without this
+        queue a Max outage (or a network hiccup) lost those posts for good: they
+        were marked ``failed`` and never retried. A retryable failure now keeps the
+        event in the ``pending`` state and the event row itself acts as the queue —
+        drained here, oldest first, with a bounded number of attempts per post.
+        """
+        rows = (await db.execute(
+            select(Event)
+            .where(Event.monitor_id == monitor.id, Event.status == "pending")
+            .order_by(Event.original_date.is_(None), Event.original_date.asc(), Event.id.asc())
+            .limit(MAX_RETRIES_PER_RUN)
+        )).scalars().all()
+        if not rows:
+            return
+        sent = 0
+        for event in rows:
+            try:
+                ai_text, ai_error = self._ai_result_from_event(event)
+                await self._send_to_max(db, monitor, self._post_from_event(event), ai_text, ai_error, event=event)
+                if event.status == "sent":
+                    sent += 1
+            except Exception as e:  # noqa: BLE001 - one bad row must not stop the queue
+                await self._add_log(db, monitor.id, "error", f"Повторная отправка поста {event.original_id} не удалась: {e}")
+            await db.commit()
+        await self._add_log(db, monitor.id, "info", f"Повторная отправка из очереди: отправлено {sent} из {len(rows)}")
+        await db.commit()
+
+    @staticmethod
+    def _attachments_from_event(event: Event) -> list:
+        """Restore the VK attachments stored as a Python literal on the event.
+
+        ``Event.attachments`` keeps ``str(post["attachments"])`` (the VK JSON
+        rendered by Python), so ``ast.literal_eval`` can read it back — no code is
+        executed, only literals are parsed.
+        """
+        if not event.attachments:
+            return []
+        try:
+            parsed = ast.literal_eval(event.attachments)
+        except (ValueError, SyntaxError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    def _post_from_event(self, event: Event) -> dict:
+        """Rebuild the post dict of a queued event (the row is the queue)."""
+        def _as_int(value, fallback):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return fallback
+
+        return {
+            "id": _as_int(event.original_id, event.original_id),
+            "owner_id": _as_int(event.original_owner_id, event.original_owner_id),
+            "url": event.original_url,
+            "text": event.original_text or "",
+            "date": event.original_date,
+            "attachments": self._attachments_from_event(event),
+            "likes": event.likes or 0,
+            "reposts": event.reposts or 0,
+            "comments": event.comments or 0,
+            "views": event.views or 0,
+            "er": event.er or 0.0,
+        }
+
+    @staticmethod
+    def _ai_result_from_event(event: Event) -> tuple:
+        """Recover the AI text/error stored on a queued event.
+
+        A rewritten text is flagged by ``ai_filtered``; a failure is stored with
+        the ``Ошибка ИИ: `` prefix (see ``_send_to_max``), in which case the
+        original text is published again on the retry.
+        """
+        stored = event.ai_analysis_result or ""
+        if event.ai_filtered and stored:
+            return stored, None
+        prefix = "Ошибка ИИ: "
+        if stored.startswith(prefix):
+            return None, stored[len(prefix):]
+        return None, None
+
+    async def _warn_skipped_posts(self, db: AsyncSession, monitor: Monitor, skipped: int) -> None:
+        """Report a burst that did not fit into ``MAX_NEW_POSTS_PER_RUN``."""
+        message = (
+            f"Всплеск публикаций: не менее {skipped} самых старых постов не обработаны — "
+            f"за прогон берётся не более {MAX_NEW_POSTS_PER_RUN} новых постов на источник. "
+            "Уменьшите периодичность проверки потока, чтобы успевать за публикациями."
+        )
+        await self._add_log(db, monitor.id, "warning", message)
+        await self._notify_once(db, monitor, f"Пропущены посты: {monitor.name}", message)
         await db.commit()
 
     def _new_event(self, monitor: Monitor, post: dict, status: str) -> Event:
@@ -416,7 +591,14 @@ class MonitorProcessor:
             max_service = MaxService(token=config.max_bot_token)
             try:
                 text_to_send = ai_text if ai_text else (post.get("text", "") or "(пост без текста)")
-                attachments = await self._build_max_attachments(max_service, monitor, post)
+                media_error: Optional[Exception] = None
+                try:
+                    attachments = await self._build_max_attachments(max_service, monitor, post)
+                except Exception as e:  # noqa: BLE001
+                    # Подготовка медиа — тоже сетевой шаг: при сбое пост не должен
+                    # потеряться (и не должен уйти без своих вложений).
+                    attachments = []
+                    media_error = e
                 if event is None:
                     # Streams without the debug log only record publications.
                     event = self._new_event(monitor, post, "failed")
@@ -436,12 +618,23 @@ class MonitorProcessor:
                 # produce a "sent" event nor inflate the published counter.
                 sent_channels: list = []
                 problems: list = []
-                if not max_channels:
+                # ``retryable`` stays True while every reason is transient (network
+                # hiccup, HTTP 5xx, rate limit): such a post is retried by the next
+                # runs instead of being lost. A missing/mistyped channel or a 4xx
+                # answer would repeat identically, so those posts are not queued.
+                retryable = True
+                if media_error is not None:
+                    problems.append(f"не удалось подготовить медиа: {media_error}")
+                    await self._add_log(db, monitor.id, "error", f"Max media error for post {post.get('id')}: {media_error}")
+                elif not max_channels:
+                    retryable = False
                     problems.append("в потоке не указан ни один Max-канал")
-                for channel in max_channels:
+                # При сбое подготовки медиа каналы не трогаем: пост ждёт повтора.
+                for channel in ([] if media_error is not None else max_channels):
                     try:
                         chat_id = await max_service.parse_chat_id(channel)
                         if not chat_id:
+                            retryable = False
                             problems.append(f"канал '{channel}' не распознан")
                             await self._add_log(db, monitor.id, "warning", f"Не отправлено: канал '{channel}' не распознан (нужен chat_id или ссылка вида https://max.ru/chat/123)")
                             continue
@@ -450,24 +643,42 @@ class MonitorProcessor:
                         await self._add_log(db, monitor.id, "info", f"Post {post['id']} sent to Max channel {channel}")
                     except MaxBotError as e:
                         monitor.publication_errors += 1
+                        if not _is_transient_max_error(e):
+                            retryable = False
                         problems.append(f"{channel}: {e}")
                         await self._add_log(db, monitor.id, "error", f"Max publish error for {channel}: {e}")
                     except Exception as e:
                         monitor.publication_errors += 1
+                        # Anything unexpected (no ``status_code``) counts as
+                        # transient and is retried a few times.
+                        retryable = retryable and _is_transient_max_error(e)
                         problems.append(f"{channel}: {e}")
                         await self._add_log(db, monitor.id, "error", f"Max error for {channel}: {e}")
 
                 if sent_channels:
                     event.status = "sent"
                     event.sent_at = datetime.utcnow()
+                    event.retry_attempts = 0
                     event.error_message = (("Не все каналы: " + "; ".join(problems))[:500] if problems else None)
                     monitor.posts_published += 1
                     if event.error_message:
                         await self._notify_once(db, monitor, f"Ошибка отправки в Max: {monitor.name}", event.error_message)
                 else:
-                    event.status = "failed"
+                    attempts = (event.retry_attempts or 0) + 1
+                    event.retry_attempts = attempts
                     event.sent_at = None
-                    event.error_message = ("Не отправлено: " + "; ".join(problems))[:500]
+                    detail = "Не отправлено: " + "; ".join(problems)
+                    if retryable and attempts < MAX_PUBLISH_ATTEMPTS:
+                        # Keep the post for the next runs (see ``_retry_pending_events``)
+                        # instead of losing it: the cursor has already moved on.
+                        event.status = "pending"
+                        event.error_message = detail[:500]
+                        await self._add_log(db, monitor.id, "warning", f"Post {post['id']} не отправлен, попытка {attempts}/{MAX_PUBLISH_ATTEMPTS}: остаётся в очереди")
+                    else:
+                        event.status = "failed"
+                        if retryable:
+                            detail += f" — попытки исчерпаны ({attempts})"
+                        event.error_message = detail[:500]
                     await self._notify_once(db, monitor, f"Ошибка отправки в Max: {monitor.name}", event.error_message)
             finally:
                 await max_service.aclose()

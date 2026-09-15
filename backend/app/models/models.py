@@ -111,10 +111,13 @@ class Event(Base):
     ai_analysis_result = Column(Text, nullable=True)  # What AI said about this post
     ai_filtered = Column(Boolean, default=False)  # True if it passed AI filter
 
-    # Status: filtered (matched), sent, failed
+    # Status: filtered (matched), sent, failed, pending (retryable Max failure)
     status = Column(String(50), default="filtered")
     sent_at = Column(DateTime, nullable=True)
     error_message = Column(Text, nullable=True)
+    # Failed publications are retried from the ``pending`` state; the counter
+    # bounds the retries so a broken Max setup cannot loop forever.
+    retry_attempts = Column(Integer, default=0)
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -155,4 +158,8 @@ class User(Base):
     role = Column(String(50), default="user", nullable=False)  # admin, user
     is_active = Column(Boolean, default=True, nullable=False)
     theme_preference = Column(String(20), default="system", nullable=False)
+    # Bumped on every password change: JWTs carry the value they were issued
+    # with, so an old token (stolen or from a shared PC) stops working at once
+    # instead of staying valid for the whole 24 h lifetime.
+    token_version = Column(Integer, default=1, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)

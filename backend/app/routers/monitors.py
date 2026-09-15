@@ -7,9 +7,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, func, delete
 from typing import List, Optional, Any
 from datetime import datetime, timedelta
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from app.models.database import get_db, AsyncSessionLocal
 from app.models.models import Monitor, Event, Log
+from app.core.limits import (
+    MAX_AI_MAX_LENGTH,
+    MAX_CHECK_INTERVAL_MINUTES,
+    MAX_ER_PERCENT,
+    MIN_AI_MAX_LENGTH,
+    MIN_CHECK_INTERVAL_MINUTES,
+    MIN_ER_PERCENT,
+    er_range_error,
+)
 from app.core.redaction import redact_sensitive_data
 from app.core.lists import normalize_monitor_lists
 from app.routers.auth import get_current_user
@@ -56,6 +65,15 @@ def raise_if_missing(missing: List[str]) -> None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Не заполнены обязательные поля: " + ", ".join(missing),
+        )
+
+
+def raise_if_invalid_er_range(min_er: Optional[float], max_er: Optional[float]) -> None:
+    """Reject an inverted ER window (the UI cannot produce one, the API can)."""
+    message = er_range_error(min_er, max_er)
+    if message:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=message
         )
 
 
@@ -112,15 +130,18 @@ class MonitorCreate(BaseModel):
     max_channels: Optional[str] = None
     keywords: Optional[str] = None
     minus_words: Optional[str] = None
-    check_interval_minutes: Optional[int] = None
+    # Numeric settings are validated here as well, not only in the UI: the API is
+    # reachable directly, and a negative interval would make the stream «due» on
+    # every scheduler tick.
+    check_interval_minutes: Optional[int] = Field(default=None, ge=MIN_CHECK_INTERVAL_MINUTES, le=MAX_CHECK_INTERVAL_MINUTES)
     copy_media: Optional[bool] = None
     log_all_posts: Optional[bool] = None
-    min_er: Optional[float] = None
-    max_er: Optional[float] = None
+    min_er: Optional[float] = Field(default=None, ge=MIN_ER_PERCENT, le=MAX_ER_PERCENT)
+    max_er: Optional[float] = Field(default=None, ge=MIN_ER_PERCENT, le=MAX_ER_PERCENT)
     use_ai: Optional[bool] = None
     ai_prompt: Optional[str] = None
     ai_tone: Optional[str] = None
-    ai_max_length: Optional[int] = None
+    ai_max_length: Optional[int] = Field(default=None, ge=MIN_AI_MAX_LENGTH, le=MAX_AI_MAX_LENGTH)
     ai_fallback_to_original: Optional[bool] = None
     is_active: Optional[bool] = None
     owner_id: Optional[int] = None
@@ -129,17 +150,17 @@ class MonitorUpdate(BaseModel):
     source_channels: Optional[str] = None
     max_channels: Optional[str] = None
     keywords: Optional[str] = None
-    check_interval_minutes: Optional[int] = None
+    check_interval_minutes: Optional[int] = Field(default=None, ge=MIN_CHECK_INTERVAL_MINUTES, le=MAX_CHECK_INTERVAL_MINUTES)
     copy_media: Optional[bool] = None
     log_all_posts: Optional[bool] = None
     owner_id: Optional[int] = None
     minus_words: Optional[str] = None
-    min_er: Optional[float] = None
-    max_er: Optional[float] = None
+    min_er: Optional[float] = Field(default=None, ge=MIN_ER_PERCENT, le=MAX_ER_PERCENT)
+    max_er: Optional[float] = Field(default=None, ge=MIN_ER_PERCENT, le=MAX_ER_PERCENT)
     use_ai: Optional[bool] = None
     ai_prompt: Optional[str] = None
     ai_tone: Optional[str] = None
-    ai_max_length: Optional[int] = None
+    ai_max_length: Optional[int] = Field(default=None, ge=MIN_AI_MAX_LENGTH, le=MAX_AI_MAX_LENGTH)
     ai_fallback_to_original: Optional[bool] = None
     is_active: Optional[bool] = None
 
@@ -458,6 +479,7 @@ async def create_monitor(data: MonitorCreate, db: AsyncSession = Depends(get_db)
     # Pasted lists are normalised (literal "\n", commas, semicolons, tabs, CRLF)
     # so that every source/channel/keyword ends up on its own line.
     fields = normalize_monitor_lists(data.model_dump(exclude_none=True, exclude={"owner_id"}))
+    raise_if_invalid_er_range(fields.get("min_er", MIN_ER_PERCENT), fields.get("max_er", MAX_ER_PERCENT))
     monitor = Monitor(**fields, owner_id=owner_id)
     db.add(monitor)
     await db.commit()
@@ -476,6 +498,9 @@ async def update_monitor(monitor_id: int, data: MonitorUpdate, db: AsyncSession 
     # then sees canonical values, so re-saving the same list is not a fresh start.
     normalize_monitor_lists(update_data)
     raise_if_missing(collect_missing_required({k: v for k, v in update_data.items() if k in REQUIRED_MONITOR_FIELDS}))
+    # The effective window is the merged value (a partial update may send only one
+    # of the two bounds).
+    raise_if_invalid_er_range(update_data.get("min_er", monitor.min_er), update_data.get("max_er", monitor.max_er))
     requested_owner = update_data.pop("owner_id", None)
     is_active_changed = "is_active" in update_data and update_data["is_active"] != monitor.is_active
     # Any *operational* setting that actually changed restarts the stream from

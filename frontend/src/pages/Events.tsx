@@ -12,6 +12,7 @@ const EMPTY_FILTERS = { status: 'all', monitor_id: 'all', date_from: '', date_to
 // Labels / colours for every status the pipeline can write into ``events``.
 const STATUS_LABELS: Record<string, string> = {
   sent: 'Отправлено',
+  pending: 'В очереди (повтор)',
   failed: 'Ошибка отправки',
   filtered_keywords: 'Отсеяно: слова',
   filtered_er: 'Отсеяно: ER',
@@ -21,6 +22,7 @@ const STATUS_LABELS: Record<string, string> = {
 }
 const STATUS_STYLES: Record<string, string> = {
   sent: 'text-emerald-600 bg-emerald-50 dark:bg-emerald-950/40',
+  pending: 'text-sky-600 bg-sky-50 dark:bg-sky-950/40',
   failed: 'text-red-600 bg-red-50 dark:bg-red-950/40',
   filtered_keywords: 'text-amber-600 bg-amber-50 dark:bg-amber-950/40',
   filtered_er: 'text-orange-600 bg-orange-50 dark:bg-orange-950/40',
@@ -29,7 +31,7 @@ const STATUS_STYLES: Record<string, string> = {
 }
 const statusLabel = (s: string) => STATUS_LABELS[s] || 'Отфильтровано'
 const statusStyle = (s: string) => STATUS_STYLES[s] || 'text-amber-600 bg-amber-50 dark:bg-amber-950/40'
-const statusBar = (s: string) => (s === 'sent' ? 'bg-emerald-500' : s === 'failed' ? 'bg-red-500' : s === 'parsed' ? 'bg-slate-400' : 'bg-amber-500')
+const statusBar = (s: string) => (s === 'sent' ? 'bg-emerald-500' : s === 'failed' ? 'bg-red-500' : s === 'pending' ? 'bg-sky-500' : s === 'parsed' ? 'bg-slate-400' : 'bg-amber-500')
 
 
 
@@ -125,7 +127,7 @@ export default function Events() {
           <div className='min-w-0'>
             <label className='block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1'>Статус</label>
             <select value={filters.status} onChange={e => update('status', e.target.value)} className='input-field text-sm py-2 min-w-0'>
-              <option value='all'>Все</option><option value='sent'>Отправлено</option><option value='failed'>Ошибка отправки</option><option value='filtered_keywords'>Отсеяно: слова</option><option value='filtered_er'>Отсеяно: ER</option><option value='filtered_ai'>Отсеяно: ИИ</option><option value='parsed'>В обработке</option><option value='filtered'>Отфильтровано (старое)</option>
+              <option value='all'>Все</option><option value='sent'>Отправлено</option><option value='pending'>В очереди (повтор)</option><option value='failed'>Ошибка отправки</option><option value='filtered_keywords'>Отсеяно: слова</option><option value='filtered_er'>Отсеяно: ER</option><option value='filtered_ai'>Отсеяно: ИИ</option><option value='parsed'>В обработке</option><option value='filtered'>Отфильтровано (старое)</option>
             </select>
           </div>
           <div className='min-w-0'>

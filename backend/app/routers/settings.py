@@ -15,6 +15,7 @@ from app.core.config import (
     set_ai_api_key,
     set_ai_settings,
 )
+from app.core.redaction import is_masked_secret, mask_secret
 from app.services.vk_service import VKService
 from app.services.ai_service import AIService
 from app.services.max_service import MaxService
@@ -89,23 +90,26 @@ async def read_settings(
     # the configured token belongs to (handy when several bots exist).
     max_bot_info = await MaxService.get_me_info(config.max_bot_token) if config.max_bot_token else None
 
+    # Secrets are never sent to the browser: the admin gets a placeholder
+    # (``••••1234``) plus the ``*_configured`` flags, so a stolen session/XSS or a
+    # proxied response cannot leak the VK/Max/AI credentials. An unchanged
+    # placeholder submitted back by the form is ignored (see ``update_settings``).
+    is_admin = user.get("role") == "admin"
+    ai_key_value = config.ai_api_key or config.gigachat_credentials
+
     return SettingsResponse(
-        vk_service_token=token_value if user.get("role") == "admin" else None,
+        vk_service_token=mask_secret(token_value) if is_admin else None,
         vk_service_token_configured=bool(token_value),
         token_status=token_valid,
         vk_account_blocked=account_blocked,
         ai_configured=ai_configured,
         ai_status=ai_valid,
-        max_bot_token=config.max_bot_token if user.get("role") == "admin" else None,
+        max_bot_token=mask_secret(config.max_bot_token) if is_admin else None,
         max_bot_token_configured=bool(config.max_bot_token),
         max_bot_token_valid=bool(max_bot_info),
         max_bot_identity=MaxService.describe_bot(max_bot_info),
         max_bot_note=(max_bot_info or {}).get("description") or None,
-        ai_api_key=(
-            config.ai_api_key or config.gigachat_credentials
-        )
-        if user.get("role") == "admin"
-        else None,
+        ai_api_key=mask_secret(ai_key_value) if is_admin else None,
         ai_provider=(config.ai_provider or "gigachat").lower(),
         ai_model=config.ai_model or "",
         ai_api_base=config.ai_api_base or "",
@@ -122,6 +126,13 @@ async def update_settings(
     admin=Depends(require_admin_role),
 ):
     updated_values = settings_data.model_dump(exclude_none=True)
+    # The form is pre-filled with placeholders (``••••1234``) instead of the real
+    # secrets; a placeholder that comes back unchanged must not overwrite the
+    # stored value.
+    for secret_field in ("vk_service_token", "max_bot_token", "ai_api_key"):
+        if is_masked_secret(updated_values.get(secret_field)):
+            updated_values.pop(secret_field, None)
+
     vk_service_token = updated_values.pop("vk_service_token", None)
     if vk_service_token is not None:
         token = vk_service_token.strip()
@@ -188,5 +199,8 @@ async def list_ai_models(payload: AIModelsRequest, admin=Depends(require_admin_r
     provider = (payload.ai_provider or config.ai_provider or "gigachat").lower()
     api_base = payload.ai_api_base if payload.ai_api_base is not None else config.ai_api_base
     api_key = (payload.ai_api_key or "").strip() or config.ai_api_key or config.gigachat_credentials
+    if is_masked_secret(api_key):
+        # The UI echoes the placeholder back when it has not been edited.
+        api_key = config.ai_api_key or config.gigachat_credentials
     ok, models, error = await AIService.list_models(provider, api_base, api_key)
     return {"ok": ok, "models": models, "error": error, "provider": provider}

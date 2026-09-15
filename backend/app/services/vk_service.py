@@ -529,6 +529,7 @@ class VKService:
         last_id: Optional[int] = None,
         max_posts: int = 100,
         page_size: int = MAX_PAGE_SIZE,
+        stats: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Return wall posts newer than ``last_id``.
 
@@ -540,6 +541,12 @@ class VKService:
 
         On the very first run (``last_id is None``) only the newest page is taken
         so the whole wall history is not fetched.
+
+        ``stats`` (optional, filled in place) reports what the cap did:
+        ``fetched`` — how many posts are returned, ``skipped`` — how many posts
+        that were left out because of ``max_posts`` (a lower bound: one extra page
+        is fetched to measure the surplus). The caller uses it to warn about a
+        burst instead of dropping the surplus silently.
         """
         page_size = max(1, min(self.MAX_PAGE_SIZE, page_size))
         cap = max(1, max_posts)
@@ -558,7 +565,10 @@ class VKService:
         last_id_int = int(last_id)
         collected: Dict[int, Dict[str, Any]] = {}
         offset = 0
-        while len(collected) < cap:
+        # One page beyond the cap is fetched on purpose: the surplus is what gets
+        # left behind (the cursor moves past it), so it must be measurable.
+        fetch_limit = cap + page_size
+        while len(collected) < fetch_limit:
             items = await self.get_wall_posts(owner_id, count=page_size, offset=offset, filter_type="owner")
             if not items:
                 break
@@ -579,7 +589,13 @@ class VKService:
                 break
 
         posts = sorted(collected.values(), key=lambda p: int(p["id"]), reverse=True)
-        return posts[:cap]
+        kept = posts[:cap]
+        if stats is not None:
+            stats["fetched"] = len(kept)
+            # ``skipped`` is a lower bound: pagination stopped at cap + page_size,
+            # so anything beyond that is unknown.
+            stats["skipped"] = len(posts) - len(kept)
+        return kept
 
     def _build_post_dict(self, item: Dict[str, Any], owner_id: int) -> Dict[str, Any]:
         """Normalise a raw VK wall item into the internal post representation."""

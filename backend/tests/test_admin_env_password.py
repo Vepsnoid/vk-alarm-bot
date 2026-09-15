@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import app.main as main_module  # noqa: E402
 import app.models.database as database_module  # noqa: E402
 from app.core.security import (  # noqa: E402
+    SHA256_HASH_PREFIX,
     create_access_token,
     decode_token,
     get_password_hash,
@@ -109,11 +110,57 @@ def test_missing_admin_is_created_with_first_version():
     assert user.role == "admin" and user.is_active
 
 
+def _run_legacy_hashes(stored_values):
+    """Прогнать настоящий hash_legacy_passwords() на in-memory БД."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    sessions = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def scenario():
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with sessions() as db:
+            for username, value in stored_values:
+                db.add(User(username=username, password_hash=value, role="user", is_active=True, token_version=1))
+            await db.commit()
+
+        original = database_module.AsyncSessionLocal
+        database_module.AsyncSessionLocal = sessions
+        try:
+            await main_module.hash_legacy_passwords()
+            async with sessions() as db:
+                rows = (await db.execute(select(User))).scalars().all()
+                return {u.username: u.password_hash for u in rows}
+        finally:
+            database_module.AsyncSessionLocal = original
+            await engine.dispose()
+
+    return asyncio.run(scenario())
+
+
+def test_long_legacy_password_migration_keeps_full_password():
+    """Legacy-пароль длиннее 72 байт мигрирует без потери «хвоста»."""
+    long_password = "я" * 40  # 80 байт в UTF-8
+    hashes = _run_legacy_hashes([("legacy-long", long_password), ("legacy-short", "короткий")])
+
+    long_hash = hashes["legacy-long"]
+    assert long_hash.startswith(SHA256_HASH_PREFIX), long_hash[:24]
+    assert verify_password(long_password, long_hash) is True
+    # Усечённая версия больше не подходит — пароль сохранился целиком.
+    assert verify_password(long_password[:36], long_hash) is False
+
+    short_hash = hashes["legacy-short"]
+    assert not short_hash.startswith(SHA256_HASH_PREFIX)
+    assert verify_password("короткий", short_hash) is True
+    # Повторный запуск миграции ничего не переписывает.
+    assert _run_legacy_hashes([("legacy-short", short_hash)])["legacy-short"] == short_hash
+
+
 _TESTS = [
     ("новый ADMIN_PASSWORD отзывает старые токены", test_env_password_change_revokes_old_tokens),
     ("тот же пароль не разлогинивает", test_unchanged_env_does_not_log_anyone_out),
     ("legacy plaintext не считается сменой пароля", test_legacy_plaintext_is_not_treated_as_a_change),
     ("админ создаётся с первой версией", test_missing_admin_is_created_with_first_version),
+    ("legacy >72 байт мигрирует без усечения", test_long_legacy_password_migration_keeps_full_password),
 ]
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 """Security utilities."""
 
+import base64
 import bcrypt
 import hashlib
 import hmac
@@ -17,10 +18,28 @@ settings = get_settings()
 # it (see ``password_byte_error``).
 BCRYPT_MAX_BYTES = 72
 
+# Схема для паролей, которые не влезают в лимит bcrypt: значение сначала
+# хешируется SHA-256 (base64), и уже этот дайджест уходит в bcrypt. Нужна для
+# legacy-записей длиннее 72 байт: иначе bcrypt молча отбрасывал бы «хвост» пароля.
+SHA256_HASH_PREFIX = "$bcrypt-sha256$"
+
 
 def _bcrypt_bytes(password: str) -> bytes:
     """Encode a password for bcrypt, truncated to bcrypt's 72-byte limit."""
     return (password or "").encode("utf-8")[:BCRYPT_MAX_BYTES]
+
+
+def _sha256_prehash(password: str) -> str:
+    """Base64 SHA-256 of the full password (44 ASCII characters, bcrypt-safe)."""
+    digest = hashlib.sha256((password or "").encode("utf-8")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _bcrypt_check(plain_password: str, hashed_password: str) -> bool:
+    try:
+        return bcrypt.checkpw(_bcrypt_bytes(plain_password), hashed_password.encode("utf-8"))
+    except Exception:
+        return False
 
 
 def password_byte_error(password: str) -> Optional[str]:
@@ -35,33 +54,57 @@ def password_byte_error(password: str) -> Optional[str]:
 
 def is_password_hash(value: str) -> bool:
     """Whether a stored value is a bcrypt hash and not a legacy plaintext value."""
-    return bool(value) and value[:4] in ("$2a$", "$2b$", "$2y$")
+    return bool(value) and (value.startswith(SHA256_HASH_PREFIX) or value[:4] in ("$2a$", "$2b$", "$2y$"))
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against a stored value.
 
-    A bcrypt hash is checked with bcrypt. Non-hash values are compared as plain
-    text (constant-time): that path exists only for ``ADMIN_PASSWORD`` read from
-    ``.env`` and for legacy rows, which ``hash_legacy_passwords()`` rewrites to
-    bcrypt on startup.
+    A bcrypt hash is checked with bcrypt (a ``$bcrypt-sha256$`` value is compared
+    against the SHA-256 prehash, see ``migrate_legacy_password``). Non-hash values
+    are compared as plain text (constant-time): that path exists only for
+    ``ADMIN_PASSWORD`` read from ``.env`` and for legacy rows, which
+    ``hash_legacy_passwords()`` rewrites to bcrypt on startup.
     """
     if not hashed_password:
         return False
+    if hashed_password.startswith(SHA256_HASH_PREFIX):
+        return _bcrypt_check(_sha256_prehash(plain_password), hashed_password[len(SHA256_HASH_PREFIX):])
     if is_password_hash(hashed_password):
-        try:
-            return bcrypt.checkpw(_bcrypt_bytes(plain_password), hashed_password.encode("utf-8"))
-        except Exception:
-            return False
+        return _bcrypt_check(plain_password, hashed_password)
     return hmac.compare_digest(
         (plain_password or "").encode("utf-8"), hashed_password.encode("utf-8")
     )
 
 
 def get_password_hash(password: str) -> str:
-    """Hash a password with bcrypt (72-byte truncation as a safety net)."""
+    """Hash a password with bcrypt (72-byte truncation as a safety net).
+
+    New passwords longer than the limit are rejected by the API/CLI, so the
+    truncation here only ever applies to legacy values.
+    """
     salt = bcrypt.gensalt()
     return bcrypt.hashpw(_bcrypt_bytes(password), salt).decode("utf-8")
+
+
+def get_prehashed_password_hash(password: str) -> str:
+    """Hash a password without the bcrypt length limit (SHA-256 prehash + bcrypt)."""
+    salt = bcrypt.gensalt()
+    digest = bcrypt.hashpw(_sha256_prehash(password).encode("ascii"), salt).decode("utf-8")
+    return f"{SHA256_HASH_PREFIX}{digest}"
+
+
+def migrate_legacy_password(plain_password: str) -> str:
+    """Hash a legacy plaintext password, keeping its full length.
+
+    Values that fit into bcrypt become a normal hash. Longer ones go through the
+    SHA-256 prehash scheme instead of being silently cut at 72 bytes — otherwise
+    the migrated hash would no longer be the password the user typed (any extra
+    bytes would stop mattering).
+    """
+    if len((plain_password or "").encode("utf-8")) > BCRYPT_MAX_BYTES:
+        return get_prehashed_password_hash(plain_password)
+    return get_password_hash(plain_password)
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:

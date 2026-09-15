@@ -15,7 +15,9 @@
 Команды ведут себя так же, как веб-панель:
   * ``set-password``/``set-role`` отзывают ранее выданные JWT (``token_version``);
   * последнего активного администратора нельзя понизить или удалить;
-  * ``delete-user`` переносит потоки удаляемого аккаунта другому администратору.
+  * ``delete-user`` переносит потоки удаляемого аккаунта другому администратору;
+  * логины нормализуются (пробелы по краям отбрасываются, пустой логин и пароль
+    длиннее 72 байт отклоняются).
 """
 
 import argparse
@@ -46,6 +48,11 @@ def _find_user(db, username):
     return select(User).where(User.username == username)
 
 
+def _clean_username(value: str) -> str:
+    """Normalise a login the same way the panel does (edge spaces are a typo)."""
+    return (value or "").strip()
+
+
 async def _active_admins(db, exclude_id=None) -> int:
     """How many active administrators remain (optionally excluding ``exclude_id``)."""
     query = select(func.count()).select_from(User).where(
@@ -69,6 +76,11 @@ async def list_users() -> int:
 
 
 async def create_user(username: str, password: str, role: str) -> int:
+    username = _clean_username(username)
+    if not username:
+        # Как и в API: логин из пробелов — мусорная запись, которую потом не найти.
+        print("Логин не может быть пустым")
+        return 1
     error = password_byte_error(password)
     if error:
         # Как и в API: лучше отказать, чем молча усечь пароль до 72 байт.
@@ -86,6 +98,7 @@ async def create_user(username: str, password: str, role: str) -> int:
 
 
 async def set_password(username: str, password: str) -> int:
+    username = _clean_username(username)
     async with AsyncSessionLocal() as db:
         user = (await db.execute(_find_user(db, username))).scalar_one_or_none()
         if not user:
@@ -101,6 +114,7 @@ async def set_password(username: str, password: str) -> int:
 
 
 async def set_role(username: str, role: str) -> int:
+    username = _clean_username(username)
     async with AsyncSessionLocal() as db:
         user = (await db.execute(_find_user(db, username))).scalar_one_or_none()
         if not user:
@@ -123,6 +137,7 @@ async def set_role(username: str, role: str) -> int:
 
 
 async def delete_user(username: str) -> int:
+    username = _clean_username(username)
     async with AsyncSessionLocal() as db:
         user = (await db.execute(_find_user(db, username))).scalar_one_or_none()
         if not user:
@@ -132,17 +147,21 @@ async def delete_user(username: str) -> int:
             print(f"Отказано: '{username}' — последний активный администратор. Сначала назначьте другого.")
             return 1
         # Потоки удаляемого аккаунта нельзя оставить без владельца — та же логика,
-        # что и в веб-панели (иначе потоки висят на несуществующем id до рестарта).
-        target_id = await resolve_default_owner_id(db)
+        # что и в веб-панели. ``exclude`` важен: иначе при удалении первого по id
+        # администратора владельцем «назначался» он сам и перенос не происходил.
+        target_id = await resolve_default_owner_id(db, exclude=user.id)
         reassigned = 0
-        if target_id and target_id != user.id:
-            result = await db.execute(
-                update(Monitor).where(Monitor.owner_id == user.id).values(owner_id=target_id)
-            )
-            reassigned = result.rowcount or 0
+        result = await db.execute(
+            update(Monitor).where(Monitor.owner_id == user.id).values(owner_id=target_id)
+        )
+        reassigned = result.rowcount or 0
         await db.delete(user)
         await db.commit()
-    print(f"Пользователь '{username}' удалён" + (f", потоки перенесены на пользователя id {target_id} ({reassigned})" if reassigned else ""))
+    if reassigned:
+        where = f"пользователю id {target_id}" if target_id else "в общий доступ (владелец не назначен)"
+        print(f"Пользователь '{username}' удалён, потоки перенесены {where} ({reassigned})")
+    else:
+        print(f"Пользователь '{username}' удалён")
     return 0
 
 

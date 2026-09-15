@@ -161,12 +161,53 @@ def test_create_user_rejects_too_long_password():
         asyncio.run(engine.dispose())
 
 
+def test_delete_first_admin_moves_streams():
+    """Удаляем первого по id админа: потоки уходят другому, а не «остаются ему»."""
+    engine, sessions, _ = _setup(
+        [{"username": "admin", "role": "admin"}, {"username": "boss", "role": "admin"}],
+        monitors=[1, 1],  # оба потока принадлежат первому админу (id 1)
+    )
+    try:
+        assert asyncio.run(manage.delete_user("admin")) == 0
+        assert _user(sessions, "admin") is None
+        assert {m.owner_id for m in _monitors(sessions)} == {2}, [m.owner_id for m in _monitors(sessions)]
+    finally:
+        asyncio.run(engine.dispose())
+
+
+def test_delete_last_user_clears_stream_owner():
+    """Если переносить некому, потоки остаются без владельца (доступ админам)."""
+    engine, sessions, _ = _setup([{"username": "user1"}], monitors=[1])
+    try:
+        assert asyncio.run(manage.delete_user("user1")) == 0
+        assert {m.owner_id for m in _monitors(sessions)} == {None}, [m.owner_id for m in _monitors(sessions)]
+    finally:
+        asyncio.run(engine.dispose())
+
+
+def test_create_user_validates_and_normalises_username():
+    """Пустой/пробельный логин отклоняется, пробелы по краям отбрасываются."""
+    engine, sessions, _ = _setup([])
+    try:
+        assert asyncio.run(manage.create_user("", "пароль", "user")) == 1
+        assert asyncio.run(manage.create_user("   ", "пароль", "user")) == 1
+        assert asyncio.run(manage.create_user("  user2  ", "пароль", "user")) == 0
+        assert _user(sessions, "user2") is not None
+        assert asyncio.run(manage.set_password(" user2 ", "другой-пароль")) == 0
+        assert verify_password("другой-пароль", _user(sessions, "user2").password_hash)
+    finally:
+        asyncio.run(engine.dispose())
+
+
 _TESTS = [
     ("set-password отзывает токены", test_set_password_revokes_tokens),
     ("set-role отзывает токены", test_set_role_revokes_tokens),
     ("последнего админа нельзя понизить", test_last_admin_cannot_be_demoted),
     ("последнего админа нельзя удалить", test_last_admin_cannot_be_deleted),
     ("delete-user переносит потоки", test_delete_user_moves_streams),
+    ("delete первого админа: потоки уходят другому", test_delete_first_admin_moves_streams),
+    ("delete последнего пользователя: владелец снимается", test_delete_last_user_clears_stream_owner),
+    ("create-user проверяет и чистит логин", test_create_user_validates_and_normalises_username),
     ("create-user проверяет длину пароля", test_create_user_rejects_too_long_password),
 ]
 

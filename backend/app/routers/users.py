@@ -224,8 +224,9 @@ async def delete_user(
         )
 
     # Reassign the streams owned by the deleted account to an admin so that no
-    # stream is ever left without an owner.
-    target_admin_id = await resolve_default_owner_id(db, prefer=admin.get("id"))
+    # stream is ever left without an owner. ``exclude`` keeps the deleted account
+    # itself from being «chosen» as the new owner.
+    target_admin_id = await resolve_default_owner_id(db, prefer=admin.get("id"), exclude=user_id)
     if target_admin_id:
         await db.execute(update(Monitor).where(Monitor.owner_id == user_id).values(owner_id=target_admin_id))
     await db.delete(user)

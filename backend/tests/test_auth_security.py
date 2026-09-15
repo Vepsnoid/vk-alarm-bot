@@ -25,11 +25,13 @@ from app.core.redaction import (  # noqa: E402
     redact_sensitive_data,
 )
 from app.core.security import (  # noqa: E402
+    SHA256_HASH_PREFIX,
     create_access_token,
     decode_token,
     get_password_hash,
     is_env_fallback_token,
     is_password_hash,
+    migrate_legacy_password,
     password_byte_error,
     prune_ttl_cache,
     secret_fingerprint,
@@ -159,9 +161,27 @@ def test_ttl_cache_is_bounded():
     assert len(cache) <= 8, len(cache)
 
 
+def test_long_legacy_password_keeps_full_entropy():
+    """Пароль длиннее 72 байт мигрирует через SHA-256, а не с усечением."""
+    long_password = "я" * 40  # 80 байт в UTF-8
+    hashed = migrate_legacy_password(long_password)
+    assert hashed.startswith(SHA256_HASH_PREFIX), hashed[:24]
+    assert is_password_hash(hashed)
+    assert verify_password(long_password, hashed) is True
+    # Раньше bcrypt смотрел только первые 72 байта — теперь важен весь пароль.
+    assert verify_password(long_password[:36], hashed) is False
+    assert verify_password(long_password + "!", hashed) is False
+
+    # Короткий пароль остаётся обычным bcrypt-хешем (совместимость).
+    short_hash = migrate_legacy_password("обычный-пароль")
+    assert not short_hash.startswith(SHA256_HASH_PREFIX)
+    assert verify_password("обычный-пароль", short_hash) is True
+
+
 _TESTS = [
     ("пароли: bcrypt и legacy plaintext", test_password_hashes_and_legacy_plaintext),
     ("длинные пароли: явная ошибка", test_long_passwords_are_not_truncated_silently),
+    ("legacy >72 байт: SHA-256 без усечения", test_long_legacy_password_keeps_full_entropy),
     ("token_version отзывает старые JWT", test_token_version_revokes_old_tokens),
     ("секреты маскируются", test_secrets_are_masked),
     ("логи редактируются", test_log_records_are_redacted),

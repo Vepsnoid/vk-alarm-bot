@@ -74,17 +74,37 @@ async def run_scheduled_monitors():
 PLACEHOLDER_ADMIN_PASSWORD = "replace-with-a-strong-password"
 
 
+async def sync_admin_password(db, admin_user, admin_password: str) -> bool:
+    """Apply the admin password from ``.env``; return True when it actually changed.
+
+    A changed password must also bump ``token_version``: JWTs carry the version
+    they were issued with, so without the bump a previously issued (possibly
+    stolen) token would stay valid for the rest of its 24-hour lifetime even
+    though the login has changed. An unchanged ``.env`` must NOT invalidate the
+    sessions of the running admin, so the password is verified first and the
+    bump happens only when the value really differs.
+    """
+    from app.core.security import get_password_hash, verify_password
+    if verify_password(admin_password, admin_user.password_hash or ""):
+        return False
+    admin_user.password_hash = get_password_hash(admin_password)
+    admin_user.token_version = (admin_user.token_version or 1) + 1
+    await db.commit()
+    return True
+
+
 async def seed_initial_user():
     """Create the admin from ``.env`` or sync its password when ``.env`` changed.
 
     ``.env`` is the documented source of truth for the admin account: editing
     ``ADMIN_PASSWORD`` and restarting the service must be enough to change the
     login. Without the sync below the old bcrypt hash stayed in the database and
-    the new password «не подходил».
+    the new password «не подходил»; the sync also revokes the tokens issued with
+    the previous password (see ``sync_admin_password``).
     """
     from app.models.database import AsyncSessionLocal
     from app.models.models import User
-    from app.core.security import get_password_hash, verify_password
+    from app.core.security import get_password_hash
     try:
         app_settings = get_settings()
         async with AsyncSessionLocal() as db:
@@ -100,10 +120,8 @@ async def seed_initial_user():
                 db.add(admin_user)
                 await db.commit()
                 logger.info("Created admin '%s' from .env", app_settings.admin_username)
-            elif not verify_password(app_settings.admin_password, admin_user.password_hash or ""):
-                admin_user.password_hash = get_password_hash(app_settings.admin_password)
-                await db.commit()
-                logger.info("Admin '%s' password updated from .env", app_settings.admin_username)
+            elif await sync_admin_password(db, admin_user, app_settings.admin_password):
+                logger.info("Admin '%s' password updated from .env, issued tokens revoked", app_settings.admin_username)
         if app_settings.admin_password == PLACEHOLDER_ADMIN_PASSWORD:
             logger.warning("ADMIN_PASSWORD is still the template placeholder — set a real password in .env")
     except Exception as e:

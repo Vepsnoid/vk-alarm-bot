@@ -20,6 +20,7 @@ git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
 git fetch --prune origin
 git checkout "$BRANCH"
 git pull --ff-only origin "$BRANCH"
+echo "    версия: $(git rev-parse --short HEAD) $(git log -1 --pretty=%s)"
 
 echo "==> Ставлю зависимости Python"
 "$VENV/bin/pip" install -q --upgrade pip
@@ -40,6 +41,27 @@ systemctl restart "$SERVICE"
 sleep 2
 systemctl --no-pager --lines=10 status "$SERVICE" || true
 
-echo "==> Проверка API"
-curl -fsS http://127.0.0.1:8000/api/health && echo
-echo "Готово."
+# Приложению нужно несколько секунд на старт (ру migrations + подсчёт хешей), поэтому
+# проверяем API с повторами: одиночный curl через 2 с после restart давал ложное
+# «Failed to connect to 127.0.0.1 port 8000», хотя сервис поднимался нормально.
+echo "==> Проверка API (до 60 с)"
+health=""
+for _ in $(seq 1 30); do
+  if health="$(curl -fsS --max-time 3 http://127.0.0.1:8000/api/health 2>/dev/null)"; then
+    break
+  fi
+  health=""
+  sleep 2
+done
+
+if [[ -n "${health}" ]]; then
+  echo "    API отвечает: ${health}"
+  echo "Готово."
+else
+  echo "ОШИБКА: API не ответил за 60 с (systemctl is-active: $(systemctl is-active "$SERVICE" 2>/dev/null || true))" >&2
+  echo "    последние строки журнала:" >&2
+  journalctl -u "$SERVICE" -n 30 --no-pager || true
+  echo "    частые причины: пустые SECRET_KEY/ADMIN_USERNAME/ADMIN_PASSWORD в .env," >&2
+  echo "    значение MAX_NEW_POSTS_PER_RUN/MAX_RETRIES_PER_RUN вне диапазона или ошибка в токенах." >&2
+  exit 1
+fi

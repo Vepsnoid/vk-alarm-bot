@@ -36,7 +36,7 @@ NEW_PASSWORD = "новый-пароль"
 ADMIN = "admin"
 
 
-def _run_seed(admin_password: str, stored_password=None, stored_hash=None):
+def _run_seed(admin_password: str, stored_password=None, stored_hash=None, role="admin", is_active=True):
     """Выполнить настоящий seed_initial_user() на in-memory БД.
 
     ``stored_hash`` позволяет положить в БД легаси-значение (plaintext) вместо
@@ -51,8 +51,8 @@ def _run_seed(admin_password: str, stored_password=None, stored_hash=None):
         if stored_hash is not None or stored_password is not None:
             value = stored_hash if stored_hash is not None else get_password_hash(stored_password)
             async with sessions() as db:
-                db.add(User(username=ADMIN, password_hash=value, role="admin",
-                            is_active=True, token_version=1))
+                db.add(User(username=ADMIN, password_hash=value, role=role,
+                            is_active=is_active, token_version=1))
                 await db.commit()
 
         original_settings = main_module.get_settings
@@ -155,12 +155,33 @@ def test_long_legacy_password_migration_keeps_full_password():
     assert _run_legacy_hashes([("legacy-short", short_hash)])["legacy-short"] == short_hash
 
 
+def test_env_admin_is_restored_as_active_admin():
+    """ADMIN_USERNAME указывает на обычного или заблокированного — возвращаем права."""
+    # Роль сняли, пароль оставили прежним.
+    user = _run_seed(OLD_PASSWORD, stored_password=OLD_PASSWORD, role="user")
+    assert user.role == "admin", user.role
+    assert user.is_active
+    assert verify_password(OLD_PASSWORD, user.password_hash)
+    assert user.token_version == 1, user.token_version  # пароль не менялся — версия та же
+
+    # Аккаунт был заблокирован.
+    blocked = _run_seed(OLD_PASSWORD, stored_password=OLD_PASSWORD, role="admin", is_active=False)
+    assert blocked.role == "admin" and blocked.is_active, (blocked.role, blocked.is_active)
+
+    # Неудачная конфигурация: .env-логин был обычным пользователем и без пароля
+    # в базе — после старта это рабочий администратор.
+    promoted = _run_seed(NEW_PASSWORD, stored_password=OLD_PASSWORD, role="user", is_active=False)
+    assert promoted.role == "admin" and promoted.is_active
+    assert verify_password(NEW_PASSWORD, promoted.password_hash)
+
+
 _TESTS = [
     ("новый ADMIN_PASSWORD отзывает старые токены", test_env_password_change_revokes_old_tokens),
     ("тот же пароль не разлогинивает", test_unchanged_env_does_not_log_anyone_out),
     ("legacy plaintext не считается сменой пароля", test_legacy_plaintext_is_not_treated_as_a_change),
     ("админ создаётся с первой версией", test_missing_admin_is_created_with_first_version),
     ("legacy >72 байт мигрирует без усечения", test_long_legacy_password_migration_keeps_full_password),
+    ("аккаунт из .env восстанавливается администратором", test_env_admin_is_restored_as_active_admin),
 ]
 
 if __name__ == "__main__":

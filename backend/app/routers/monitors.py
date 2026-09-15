@@ -9,7 +9,7 @@ from typing import List, Optional, Any
 from datetime import datetime, timedelta
 from pydantic import BaseModel, Field
 from app.models.database import get_db, AsyncSessionLocal
-from app.models.models import Monitor, Event, Log
+from app.models.models import Monitor, Event, Log, User
 from app.core.limits import (
     MAX_AI_MAX_LENGTH,
     MAX_CHECK_INTERVAL_MINUTES,
@@ -475,6 +475,13 @@ async def create_monitor(data: MonitorCreate, db: AsyncSession = Depends(get_db)
     # Admins own their streams too (so the per-user filter finds them) but may
     # assign a different owner; regular users always own what they create.
     owner_id = data.owner_id if (user.get("role") == "admin" and data.owner_id) else user.get("id")
+    if user.get("role") == "admin" and data.owner_id and await db.get(User, data.owner_id) is None:
+        # Явно указанный владелец должен существовать: молча подменять его нельзя,
+        # иначе админ думает, что поток отдан одному, а он уходит другому.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Пользователь-владелец id={data.owner_id} не найден",
+        )
     owner_id = await resolve_default_owner_id(db, prefer=owner_id)
     # Pasted lists are normalised (literal "\n", commas, semicolons, tabs, CRLF)
     # so that every source/channel/keyword ends up on its own line.
@@ -516,6 +523,13 @@ async def update_monitor(monitor_id: int, data: MonitorUpdate, db: AsyncSession 
         setattr(monitor, key, value)
     # Only admins may (re)assign ownership.
     if user.get("role") == "admin" and requested_owner is not None:
+        if await db.get(User, requested_owner) is None:
+            # Иначе поток «повиснет» на несуществующем id: обычный пользователь его
+            # не увидит, а чинится это только backfill'ом при следующем старте.
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Пользователь-владелец id={requested_owner} не найден",
+            )
         monitor.owner_id = requested_owner
     if not monitor.is_active:
         # Keep the pause marker: the run that resumes the stream starts fresh

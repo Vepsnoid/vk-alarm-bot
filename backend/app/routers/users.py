@@ -132,44 +132,9 @@ async def update_user(
     previous_username = user.username
     is_env_admin = previous_username == get_settings().admin_username
 
-    if data.username and data.username.strip() != user.username:
-        existing = await db.execute(
-            select(User).where(User.username == data.username.strip())
-        )
-        if existing.scalar_one_or_none():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Пользователь с таким именем уже существует",
-            )
-        user.username = data.username.strip()
-        if is_env_admin:
-            # Keep .env in sync: without it the next start would seed a *second*
-            # admin under the old login and leave the renamed one an administrator.
-            # (Tokens of database accounts die on a rename anyway, their ``sub`` no
-            # longer matches a row.)
-            try:
-                set_admin_username(user.username)
-            except Exception as e:
-                logger.warning("Could not persist the admin username to .env: %s", e)
-
-    if data.password and data.password.strip():
-        pw_error = password_byte_error(data.password.strip())
-        if pw_error:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=pw_error
-            )
-        user.password_hash = get_password_hash(data.password.strip())
-        # A new password must kill the sessions issued with the old one: the JWT
-        # lifetimes (24 h) are otherwise wide open for a stolen token.
-        user.token_version = (user.token_version or 1) + 1
-        # Keep .env in sync when the .env admin's own password is changed here:
-        # startup seeding treats .env as the source of truth for that account, so
-        # without this the change would be reverted on the next restart.
-        if is_env_admin:
-            try:
-                set_admin_password(data.password.strip())
-            except Exception as e:
-                logger.warning("Could not persist the admin password to .env: %s", e)
+    # Validations run BEFORE anything is written — including .env. Otherwise a
+    # rejected request (e.g. an admin trying to demote themselves) would leave a new
+    # login/password in .env while the database transaction is rolled back.
     if data.role and data.role not in ("admin", "user"):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -193,6 +158,37 @@ async def update_user(
                 detail="Нельзя снять роль последнего администратора",
             )
 
+    if data.password and data.password.strip():
+        pw_error = password_byte_error(data.password.strip())
+        if pw_error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=pw_error
+            )
+
+    # --- запрос прошёл проверки: дальше только изменения в БД, а .env пишем ---
+    # --- после успешного commit (иначе файл разъедется с базой).            ---
+    renamed = False
+    if data.username and data.username.strip() != user.username:
+        existing = await db.execute(
+            select(User).where(User.username == data.username.strip())
+        )
+        if existing.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Пользователь с таким именем уже существует",
+            )
+        user.username = data.username.strip()
+        renamed = True
+
+    new_env_password = None
+    if data.password and data.password.strip():
+        user.password_hash = get_password_hash(data.password.strip())
+        # A new password must kill the sessions issued with the old one: the JWT
+        # lifetimes (24 h) are otherwise wide open for a stolen token.
+        user.token_version = (user.token_version or 1) + 1
+        if is_env_admin:
+            new_env_password = data.password.strip()
+
     if data.role:
         user.role = data.role
 
@@ -201,6 +197,26 @@ async def update_user(
 
     await db.commit()
     await db.refresh(user)
+
+    # .env is written only now: the database changes are already committed, so a
+    # failure here cannot desync the file from the database in the other direction
+    # (a rejected request leaves .env untouched, see the validations above).
+    if renamed and is_env_admin:
+        # Without this the next start would seed a *second* admin under the old login
+        # and leave the renamed one an administrator. (Tokens of database accounts
+        # die on a rename anyway, their ``sub`` no longer matches a row.)
+        try:
+            set_admin_username(user.username)
+        except Exception as e:
+            logger.warning("Could not persist the admin username to .env: %s", e)
+    if new_env_password:
+        # Startup seeding treats .env as the source of truth for that account, so
+        # without this the new password would be reverted on the next restart.
+        try:
+            set_admin_password(new_env_password)
+        except Exception as e:
+            logger.warning("Could not persist the admin password to .env: %s", e)
+
     return user
 
 

@@ -123,10 +123,88 @@ def test_env_admin_password_change_is_still_synced():
     assert result.token_version == 2, result.token_version
 
 
+def test_rejected_update_does_not_touch_env():
+    """Отклонённый запрос (самопонижение) не должен менять .env."""
+    from fastapi import HTTPException
+
+    state = {}
+
+    async def scenario(db, env):
+        try:
+            await update_user(
+                ADMIN_ID,
+                UserUpdate(username="root", password="новый-пароль", role="user"),
+                db=db,
+                admin=dict(ADMIN_TOKEN),  # админ правит сам себя
+            )
+        except HTTPException as exc:
+            state["code"] = exc.status_code
+        # Строка в БД должна остаться прежней (транзакция откатывается).
+        state["user"] = (await db.execute(select(User).where(User.username == ENV_ADMIN))).scalars().one_or_none()
+        return None
+
+    _, env, _ = _run([{"username": ENV_ADMIN, "role": "admin"}], scenario)
+
+    assert state.get("code") == 400, state.get("code")
+    assert env.usernames == [], env.usernames
+    assert env.passwords == [], env.passwords
+    user = state["user"]
+    assert user is not None and user.role == "admin", user
+    assert verify_password("пароль", user.password_hash)  # старый пароль не тронут
+
+
+def test_last_admin_guard_keeps_env_untouched():
+    """Запрет понизить последнего админа тоже не пишет в .env."""
+    from fastapi import HTTPException
+
+    state = {}
+
+    async def scenario(db, env):
+        try:
+            await update_user(
+                ADMIN_ID,
+                UserUpdate(username="root", password="новый-пароль", role="user"),
+                db=db,
+                admin={"id": 99, "role": "admin", "username": "other"},
+            )
+        except HTTPException as exc:
+            state["code"] = exc.status_code
+        state["user"] = (await db.execute(select(User).where(User.username == ENV_ADMIN))).scalars().one_or_none()
+        return None
+
+    _, env, _ = _run([{"username": ENV_ADMIN, "role": "admin"}], scenario)
+
+    assert state.get("code") == 400, state.get("code")
+    assert env.usernames == [], env.usernames
+    assert env.passwords == [], env.passwords
+    assert state["user"].role == "admin", state["user"].role
+
+
+def test_successful_update_writes_env_after_commit():
+    """Успешный апдейт .env-админа пишет логин и пароль (после коммита)."""
+    async def scenario(db, env):
+        return await update_user(
+            ADMIN_ID,
+            UserUpdate(username="root", password="новый-пароль"),
+            db=db,
+            admin=dict(ADMIN_TOKEN),
+        )
+
+    result, env, _ = _run([{"username": ENV_ADMIN, "role": "admin"}], scenario)
+
+    assert result.username == "root", result.username
+    assert env.usernames == ["root"], env.usernames
+    assert env.passwords == ["новый-пароль"], env.passwords
+    assert verify_password("новый-пароль", result.password_hash)
+
+
 _TESTS = [
     ("переименование .env-админа пишется в .env", test_renaming_env_admin_updates_env),
     ("пароль однофамильца не уходит в .env", test_password_of_same_named_user_is_not_written_to_env),
     ("пароль .env-админа синхронизируется", test_env_admin_password_change_is_still_synced),
+    ("отклонённый апдейт не трогает .env", test_rejected_update_does_not_touch_env),
+    ("запрет последнего админа не трогает .env", test_last_admin_guard_keeps_env_untouched),
+    ("успешный апдейт пишет .env", test_successful_update_writes_env_after_commit),
 ]
 
 if __name__ == "__main__":

@@ -74,33 +74,49 @@ async def run_scheduled_monitors():
 PLACEHOLDER_ADMIN_PASSWORD = "replace-with-a-strong-password"
 
 
-async def sync_admin_password(db, admin_user, admin_password: str) -> bool:
-    """Apply the admin password from ``.env``; return True when it actually changed.
+async def apply_env_admin(db, admin_user, admin_password: str) -> list:
+    """Make the ``.env`` account a working recovery admin; return what changed.
 
-    A changed password must also bump ``token_version``: JWTs carry the version
-    they were issued with, so without the bump a previously issued (possibly
-    stolen) token would stay valid for the rest of its 24-hour lifetime even
-    though the login has changed. An unchanged ``.env`` must NOT invalidate the
-    sessions of the running admin, so the password is verified first and the
-    bump happens only when the value really differs.
+    ``.env`` is the documented source of truth for this login, so the restart
+    enforces both halves of that promise:
+
+    * a changed ``ADMIN_PASSWORD`` is applied and ``token_version`` is bumped —
+      JWTs carry the version they were issued with, so without the bump a
+      previously issued (possibly stolen) token would stay valid for the rest of
+      its 24-hour lifetime;
+    * the account is restored to an **active administrator**. Otherwise pointing
+      ``ADMIN_USERNAME`` at an existing ordinary/blocked account would leave the
+      «break-glass» login without admin rights — and, in the worst case, the panel
+      without any administrator at all.
+
+    Nothing is written when the account already matches (an unchanged ``.env``
+    must not invalidate the sessions of the running admin), and the caller commits
+    the returned changes.
     """
     from app.core.security import get_password_hash, verify_password
-    if verify_password(admin_password, admin_user.password_hash or ""):
-        return False
-    admin_user.password_hash = get_password_hash(admin_password)
-    admin_user.token_version = (admin_user.token_version or 1) + 1
-    await db.commit()
-    return True
+    changes = []
+    if admin_user.role != "admin":
+        admin_user.role = "admin"
+        changes.append("role")
+    if not admin_user.is_active:
+        admin_user.is_active = True
+        changes.append("is_active")
+    if not verify_password(admin_password, admin_user.password_hash or ""):
+        admin_user.password_hash = get_password_hash(admin_password)
+        admin_user.token_version = (admin_user.token_version or 1) + 1
+        changes.append("password")
+    return changes
 
 
 async def seed_initial_user():
-    """Create the admin from ``.env`` or sync its password when ``.env`` changed.
+    """Create the admin from ``.env`` or sync it when ``.env`` changed.
 
     ``.env`` is the documented source of truth for the admin account: editing
-    ``ADMIN_PASSWORD`` and restarting the service must be enough to change the
-    login. Without the sync below the old bcrypt hash stayed in the database and
-    the new password «не подходил»; the sync also revokes the tokens issued with
-    the previous password (see ``sync_admin_password``).
+    ``ADMIN_USERNAME``/``ADMIN_PASSWORD`` and restarting the service must be enough
+    to get a working administrator. Without the sync below the old bcrypt hash
+    stayed in the database and the new password «не подходил»; the sync also
+    revokes the tokens issued with the previous password and restores the role of
+    the account (see ``apply_env_admin``).
     """
     from app.models.database import AsyncSessionLocal
     from app.models.models import User
@@ -120,8 +136,20 @@ async def seed_initial_user():
                 db.add(admin_user)
                 await db.commit()
                 logger.info("Created admin '%s' from .env", app_settings.admin_username)
-            elif await sync_admin_password(db, admin_user, app_settings.admin_password):
-                logger.info("Admin '%s' password updated from .env, issued tokens revoked", app_settings.admin_username)
+            else:
+                changes = await apply_env_admin(db, admin_user, app_settings.admin_password)
+                if changes:
+                    await db.commit()
+                    if "password" in changes:
+                        logger.info("Admin '%s' password updated from .env, issued tokens revoked", app_settings.admin_username)
+                    if "role" in changes or "is_active" in changes:
+                        # Значит, break-glass аккаунт кто-то понизил или заблокировал:
+                        # .env для этого логина — источник истины, поэтому возвращаем права.
+                        logger.warning(
+                            "Аккаунт '%s' из .env восстановлен как активный администратор (%s)",
+                            app_settings.admin_username,
+                            ", ".join(changes),
+                        )
         if app_settings.admin_password == PLACEHOLDER_ADMIN_PASSWORD:
             logger.warning("ADMIN_PASSWORD is still the template placeholder — set a real password in .env")
     except Exception as e:

@@ -55,20 +55,49 @@ DEFAULT_CHECK_INTERVAL_MINUTES = 15
 # timeouts inside the processor keep one stream from eating the whole budget).
 SCHEDULER_RUN_TIMEOUT_SECONDS = 1500
 
+# The run started by the current tick (see ``run_scheduled_monitors``). Kept so that
+# overlapping ticks can be skipped deliberately and so that shutdown can cancel it.
+_dispatch_task: Optional[asyncio.Task] = None
 
-async def run_scheduled_monitors():
-    processor = MonitorProcessor()
+
+async def _dispatch_streams():
+    """One dispatcher run (executed as a background task, see below)."""
+    processor = None
     try:
+        processor = MonitorProcessor()
         await asyncio.wait_for(
             processor.process_due_monitors(DEFAULT_CHECK_INTERVAL_MINUTES),
             timeout=SCHEDULER_RUN_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
         logger.error("Scheduled stream processing timed out after %s s and was aborted", SCHEDULER_RUN_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        logger.info("Scheduled stream processing cancelled (shutdown)")
+        raise
     except Exception as e:
         logger.error(f"Scheduled monitor processing failed: {e}")
     finally:
-        await processor.vk.aclose()
+        if processor is not None:
+            await processor.vk.aclose()
+
+
+async def run_scheduled_monitors():
+    """Scheduler tick: starts a run and returns at once.
+
+    A tick happens every 30 s while a real run may take minutes (a stream with many
+    sources walks them one by one with pauses, up to ``SCHEDULER_RUN_TIMEOUT_SECONDS``).
+    Awaiting the run inside the job made APScheduler consider the job «still running»
+    and print a scary ``skipped: maximum number of running instances reached`` warning
+    on every single tick. The run is therefore started as a task: overlapping ticks
+    are skipped explicitly (with a clear log line) and never interrupt the run — the
+    next tick after it finishes simply picks up whatever became due in the meantime.
+    """
+    global _dispatch_task
+    if _dispatch_task is not None and not _dispatch_task.done():
+        logger.info("Диспетчер: предыдущий прогон ещё выполняется — тик пропущен")
+        return
+    _dispatch_task = asyncio.create_task(_dispatch_streams())
+
 
 
 PLACEHOLDER_ADMIN_PASSWORD = "replace-with-a-strong-password"
@@ -319,12 +348,31 @@ async def lifespan(app: FastAPI):
     await hash_legacy_passwords()
     await backfill_stream_owners()
 
-    scheduler.add_job(run_scheduled_monitors, trigger=IntervalTrigger(seconds=DISPATCHER_TICK_SECONDS, jitter=10), id="monitor_dispatcher", replace_existing=True)
+    scheduler.add_job(
+        run_scheduled_monitors,
+        trigger=IntervalTrigger(seconds=DISPATCHER_TICK_SECONDS, jitter=10),
+        id="monitor_dispatcher",
+        replace_existing=True,
+        # Тики, пропущенные из-за долгого прогона, складываются в один следующий
+        # запуск, а не выстраиваются в очередь (см. ``run_scheduled_monitors``).
+        coalesce=True,
+        max_instances=1,
+    )
     scheduler.start()
     yield
     # ``wait=False`` keeps reloads and shutdown fast even while a long stream run
     # is still in flight.
     scheduler.shutdown(wait=False)
+    # ...но запущенный тиком прогон отменяем явно: он держит VK-клиент и сессию БД,
+    # а цикл событий сейчас закроется.
+    if _dispatch_task is not None and not _dispatch_task.done():
+        _dispatch_task.cancel()
+        try:
+            await _dispatch_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Dispatcher run did not finish cleanly: %s", e)
     await engine.dispose()
 
 

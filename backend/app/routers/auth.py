@@ -19,7 +19,12 @@ from app.models.models import User
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 security = HTTPBearer(auto_error=False)
-settings = get_settings()
+
+# NOTE: настройки читаются на каждый запрос (``config = get_settings()``), а не
+# кэшируются в этом модуле: смена ADMIN_USERNAME/ADMIN_PASSWORD из панели пишется
+# в .env и сбрасывает кэш ``get_settings`` (``set_admin_username`` /
+# ``set_admin_password``), поэтому «замороженный» на импорте объект остался бы
+# старым до перезапуска процесса — и аварийный вход по новому логину не работал бы.
 
 
 class LoginRequest(BaseModel):
@@ -49,6 +54,7 @@ async def login(
     credentials: LoginRequest,
     db: AsyncSession = Depends(get_db),
 ):
+    config = get_settings()
     # Check DB user accounts first
     result = await db.execute(
         select(User).where(User.username == credentials.username)
@@ -69,11 +75,11 @@ async def login(
         return {"access_token": token, "token_type": "bearer"}
 
     # Fallback to .env admin credentials for bootstrapping
-    if credentials.username == settings.admin_username and verify_password(
-        credentials.password, settings.admin_password
+    if credentials.username == config.admin_username and verify_password(
+        credentials.password, config.admin_password
     ):
         token = create_access_token(
-            {"sub": settings.admin_username, "role": "admin", "tv": 0}
+            {"sub": config.admin_username, "role": "admin", "tv": 0}
         )
         return {"access_token": token, "token_type": "bearer"}
 
@@ -98,6 +104,9 @@ async def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token"
         )
 
+    # Свежие настройки: логин .env-админа мог быть переименован из панели в этом же
+    # процессе (см. комментарий у ``router``).
+    config = get_settings()
     username = payload.get("sub")
     result = await db.execute(select(User).where(User.username == username))
     user = result.scalar_one_or_none()
@@ -127,10 +136,10 @@ async def get_current_user(
     # renamed/deleted). Only tokens minted by the recovery login itself are accepted
     # here (``tv = 0``): without that check, deleting the admin row would make every
     # previously issued admin token valid again and unrevocable.
-    if username == settings.admin_username and is_env_fallback_token(payload):
+    if username == config.admin_username and is_env_fallback_token(payload):
         return {
             "id": 0,
-            "username": settings.admin_username,
+            "username": config.admin_username,
             "role": "admin",
             "is_active": True,
             "theme_preference": "system",

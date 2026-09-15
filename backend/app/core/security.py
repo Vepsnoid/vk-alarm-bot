@@ -10,7 +10,9 @@ from typing import Dict, Optional
 from jose import JWTError, jwt
 from app.core.config import get_settings
 
-settings = get_settings()
+# NOTE: секрет читается при каждом обращении (``get_settings().secret_key``), а не
+# кэшируется на импорте модуля: так смена конфигурации в .env не может оставить
+# модуль со «старым» секретом после ``get_settings.cache_clear()``.
 
 # bcrypt never hashes more than 72 bytes of input. Newer ``bcrypt`` releases
 # (5.x) raise a ValueError instead of truncating silently, so the limit is
@@ -114,12 +116,12 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     else:
         expire = datetime.utcnow() + timedelta(hours=24)
     to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, settings.secret_key, algorithm="HS256")
+    return jwt.encode(to_encode, get_settings().secret_key, algorithm="HS256")
 
 
 def decode_token(token: str) -> Optional[dict]:
     try:
-        payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
+        payload = jwt.decode(token, get_settings().secret_key, algorithms=["HS256"])
         return payload
     except JWTError:
         return None
